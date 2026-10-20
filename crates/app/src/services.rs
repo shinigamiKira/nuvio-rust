@@ -16,13 +16,13 @@ use crate::images::Images;
 use crate::p2p::Engine;
 
 pub enum Msg {
-    Manifest { url: String, result: Result<Manifest, String>, from_cache: bool },
-    Catalog { key: String, result: Result<CatalogPage, String>, from_cache: bool },
+    Manifest { url: String, result: Result<Manifest, String> },
+    Catalog { key: String, result: Result<CatalogPage, String> },
     CatalogMore { key: String, skip: usize, result: Result<CatalogPage, String> },
     Meta { request: u64, result: Result<MetaDetails, String> },
     Streams { request: u64, addon_url: String, result: Result<Vec<Stream>, String> },
     Search { request: u64, key: String, title: String, subtitle: String, result: Result<CatalogPage, String> },
-    Subtitles { request: u64, entries: Vec<nuvio_core::stream::StreamSubtitle> },
+    Subtitles { request: u64, entries: Vec<nuvio_core::stream::AddonSubtitle> },
     KotlinAddons(Vec<String>),
     /// A torrent stream is ready to play (its loopback URL), or could not be opened.
     Torrent { request: u64, result: Result<String, String> },

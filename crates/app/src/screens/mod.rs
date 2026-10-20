@@ -55,7 +55,6 @@ pub enum Action {
     OpenStreams { video: Option<Video> },
     Play(Box<PlayRequest>),
     ToggleLibrary(MetaPreview),
-    Toast(String),
     AddAddon(String),
     ImportKotlinAddons,
     Fullscreen(bool),
@@ -72,12 +71,6 @@ pub struct Cx<'a> {
     pub view: &'a mut ViewState,
 }
 
-impl Cx<'_> {
-    pub fn push(&mut self, action: Action) {
-        self.actions.push(action);
-    }
-}
-
 /// UI-only state that has to survive between frames: the hero's position, text being typed, open pickers.
 pub struct ViewState {
     pub hero_index: usize,
@@ -87,9 +80,11 @@ pub struct ViewState {
     pub add_addon_error: Option<String>,
     pub settings_page: settings::Page,
     pub library_filter: library::Filter,
-    pub open_facet: Option<nuvio_core::stream::Facet>,
     pub fullscreen: bool,
     pub search_focused: bool,
+    /// Streams already warmed up, so resting on one card twice asks once.
+    pub warmed: std::collections::HashSet<String>,
+    pub hovered_stream: Option<(usize, Instant)>,
 }
 
 impl Default for ViewState {
@@ -102,9 +97,10 @@ impl Default for ViewState {
             add_addon_error: None,
             settings_page: settings::Page::Addons,
             library_filter: library::Filter::All,
-            open_facet: None,
             fullscreen: false,
             search_focused: false,
+            warmed: Default::default(),
+            hovered_stream: None,
         }
     }
 }

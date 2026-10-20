@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use nuvio_core::addon::{CatalogDef, Manifest};
 use nuvio_core::client::{HOME_PREVIEW_ITEMS, StreamSource};
 use nuvio_core::meta::{MetaDetails, MetaPreview};
-use nuvio_core::store::{AddonEntry, AddonList, CINEMETA, JsonFile, Library, ProgressBook, Settings, unix_seconds};
+use nuvio_core::store::{AddonEntry, AddonList, CINEMETA, JsonFile, Library, ProgressBook, Settings};
 use nuvio_core::stream::{Facet, Stream};
 
 use crate::services::{Msg, Services};
@@ -65,7 +65,6 @@ pub struct Section {
     pub key: String,
     pub title: String,
     pub subtitle: String,
-    pub kind: String,
     pub def: CatalogDef,
     pub manifest_url: String,
     pub items: Vec<MetaPreview>,
@@ -86,7 +85,6 @@ pub struct DetailsState {
 
 pub struct StreamGroup {
     pub addon_url: String,
-    pub addon_name: String,
     pub state: Load<usize>,
     pub streams: Vec<Stream>,
 }
@@ -104,7 +102,6 @@ pub struct StreamsState {
     pub request: u64,
     pub groups: Vec<StreamGroup>,
     pub selection: BTreeMap<Facet, String>,
-    pub started: Instant,
 }
 
 impl StreamsState {
@@ -236,7 +233,7 @@ impl State {
         let (client, url) = (svc.client.clone(), url.to_owned());
         svc.spawn(async move {
             let result = client.manifest(&url).await.map_err(|e| e.to_string());
-            Msg::Manifest { url, result, from_cache: false }
+            Msg::Manifest { url, result }
         });
     }
 
@@ -298,7 +295,6 @@ impl State {
                     key: key.clone(),
                     title: String::new(),
                     subtitle: String::new(),
-                    kind: def.kind.clone(),
                     def: def.clone(),
                     manifest_url: addon.entry.manifest_url.clone(),
                     items: Vec::new(),
@@ -360,7 +356,7 @@ impl State {
             self.catalog_inflight += 1;
             svc.spawn(async move {
                 let result = client.catalog(&manifest_url, &def, 0, Some(HOME_PREVIEW_ITEMS)).await.map_err(|e| e.to_string());
-                Msg::Catalog { key, result, from_cache: false }
+                Msg::Catalog { key, result }
             });
         }
     }
@@ -438,7 +434,7 @@ impl State {
             .addons
             .iter()
             .filter(|a| a.is_active() && a.manifest.as_ref().is_some_and(|m| m.supports("stream", &kind, &video_id)))
-            .map(|a| StreamGroup { addon_url: a.entry.manifest_url.clone(), addon_name: a.display_name(), state: Load::Loading, streams: Vec::new() })
+            .map(|a| StreamGroup { addon_url: a.entry.manifest_url.clone(), state: Load::Loading, streams: Vec::new() })
             .collect();
         for addon in self.addons.iter().filter(|a| a.is_active() && a.manifest.as_ref().is_some_and(|m| m.supports("stream", &kind, &video_id))) {
             let manifest = addon.manifest.as_ref();
@@ -491,7 +487,7 @@ impl State {
 
     pub fn apply(&mut self, message: Msg, svc: &Services) {
         match message {
-            Msg::Manifest { url, result, .. } => {
+            Msg::Manifest { url, result } => {
                 let mut changed = false;
                 if let Some(addon) = self.addons.iter_mut().find(|a| a.entry.manifest_url == url) {
                     match result {
@@ -511,7 +507,7 @@ impl State {
                     self.rebuild_sections(svc);
                 }
             }
-            Msg::Catalog { key, result, .. } => {
+            Msg::Catalog { key, result } => {
                 self.catalog_inflight = self.catalog_inflight.saturating_sub(1);
                 if let Some(section) = self.sections.iter_mut().find(|s| s.key == key) {
                     match result {
@@ -591,9 +587,18 @@ impl State {
         }
     }
 
-    pub fn now() -> u64 {
-        unix_seconds()
+    /// The addons that can offer subtitles for a video.
+    pub fn subtitle_sources(&self, kind: &str, video_id: &str) -> Vec<StreamSource> {
+        self.addons
+            .iter()
+            .filter(|a| a.is_active())
+            .filter_map(|a| {
+                let manifest = a.manifest.as_ref().filter(|m| m.supports("subtitles", kind, video_id))?;
+                Some(StreamSource { manifest_url: a.entry.manifest_url.clone(), name: a.display_name(), id: manifest.id.clone(), logo: None })
+            })
+            .collect()
     }
+
 }
 
 pub fn type_label(kind: &str) -> String {

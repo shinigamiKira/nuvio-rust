@@ -74,8 +74,6 @@ pub fn palette_by_id(id: &str) -> Palette {
 /// What every widget reads its colours from.
 #[derive(Debug, Clone)]
 pub struct Theme {
-    pub palette: Palette,
-    pub amoled: bool,
     pub background: Color32,
     pub surface: Color32,
     pub card: Color32,
@@ -85,18 +83,13 @@ pub struct Theme {
     pub text_secondary: Color32,
     pub text_muted: Color32,
     pub border: Color32,
-    pub border_subtle: Color32,
     pub danger: Color32,
-    pub success: Color32,
     pub warning: Color32,
-    pub info: Color32,
 }
 
 impl Theme {
     pub fn new(palette: Palette, amoled: bool) -> Self {
         Self {
-            palette,
-            amoled,
             background: if amoled { Color32::BLACK } else { palette.background },
             surface: palette.background_elevated,
             card: palette.background_card,
@@ -106,11 +99,8 @@ impl Theme {
             text_secondary: rgb(0xB8BEC5),
             text_muted: rgb(0x969CA3),
             border: rgb(0x252A2A),
-            border_subtle: Color32::from_rgba_unmultiplied(0x25, 0x2A, 0x2A, 140),
             danger: rgb(0xE36A8A),
-            success: rgb(0x66BB6A),
             warning: rgb(0xFFC857),
-            info: rgb(0x42A5F5),
         }
     }
 }
@@ -134,15 +124,7 @@ pub fn set(theme: Theme) {
 
 /// Spacing scale from `NuvioTokens.Space`, in points.
 pub mod space {
-    pub const S4: f32 = 4.0;
-    pub const S6: f32 = 6.0;
     pub const S8: f32 = 8.0;
-    pub const S10: f32 = 10.0;
-    pub const S12: f32 = 12.0;
-    pub const S14: f32 = 14.0;
-    pub const S16: f32 = 16.0;
-    pub const S20: f32 = 20.0;
-    pub const S24: f32 = 24.0;
     pub const S32: f32 = 32.0;
     pub const S40: f32 = 40.0;
     pub const S56: f32 = 56.0;
@@ -166,11 +148,8 @@ pub mod size {
     pub const BODY_LG: f32 = 16.0;
     pub const TITLE_SM: f32 = 18.0;
     pub const TITLE_MD: f32 = 22.0;
-    pub const HEADLINE: f32 = 26.0;
     pub const TITLE_LG: f32 = 28.0;
-    pub const DISPLAY_SM: f32 = 32.0;
     pub const PAGE_DISPLAY: f32 = 38.0;
-    pub const DISPLAY_MD: f32 = 48.0;
 }
 
 /// Motion durations from `NuvioTokens.Motion`, in seconds.
@@ -178,7 +157,6 @@ pub mod motion {
     pub const FAST: f32 = 0.15;
     pub const NORMAL: f32 = 0.22;
     pub const SLOW: f32 = 0.40;
-    pub const CINEMATIC: f32 = 0.70;
 }
 
 pub fn semibold(size: f32) -> FontId {

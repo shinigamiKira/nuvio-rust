@@ -167,6 +167,22 @@ pub fn parse_streams(payload: &[u8], addon_name: &str, addon_id: &str, addon_log
         .collect()
 }
 
+/// A subtitle file offered by an addon that serves the `subtitles` resource.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddonSubtitle {
+    pub addon: String,
+    pub language: String,
+    pub url: String,
+}
+
+pub fn parse_subtitles(payload: &[u8], addon: &str) -> Vec<AddonSubtitle> {
+    let Ok(root) = serde_json::from_slice::<Value>(payload) else { return Vec::new() };
+    root.array("subtitles")
+        .iter()
+        .filter_map(|s| Some(AddonSubtitle { addon: addon.to_owned(), language: s.text("lang").unwrap_or_else(|| "und".into()), url: s.text("url")? }))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Facets
 
@@ -267,6 +283,10 @@ impl Stream {
             if let Some(service) = parts.get(1).filter(|s| !s.is_empty()) {
                 values.insert(Facet::Service, vec![service.to_uppercase()]);
             }
+        }
+
+        if !values.contains_key(&Facet::Addon) && !self.addon_name.is_empty() {
+            values.insert(Facet::Addon, vec![self.addon_name.clone()]);
         }
 
         let mut languages: Vec<String> = Vec::new();
@@ -370,6 +390,13 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_without_an_addon_line_belongs_to_the_addon_that_returned_it() {
+        let mut s = stream("1080p", "no addon line here");
+        s.addon_name = "Torrentio".into();
+        assert_eq!(s.facet_values()[&Facet::Addon], vec!["Torrentio"]);
+    }
+
+    #[test]
     fn options_ignore_their_own_selection_but_respect_the_others() {
         let streams = vec![
             stream("2160p DV", "Addon : A | RD"),
@@ -424,6 +451,15 @@ mod tests {
         assert_eq!(site.playback(), Some(Playback::External("https://site.test/watch".into())));
         let yt = Stream { yt_id: Some("dQw4w9WgXcQ".into()), ..Stream::default() };
         assert!(matches!(yt.playback(), Some(Playback::External(u)) if u.contains("dQw4w9WgXcQ")));
+    }
+
+    #[test]
+    fn reads_subtitle_responses() {
+        let payload = br#"{"subtitles":[{"id":"1","url":"https://s.test/a.srt","lang":"eng"},{"id":"2","lang":"fra"},{"url":"https://s.test/b.vtt"}]}"#;
+        let subs = parse_subtitles(payload, "OpenSubs");
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0], AddonSubtitle { addon: "OpenSubs".into(), language: "eng".into(), url: "https://s.test/a.srt".into() });
+        assert_eq!(subs[1].language, "und");
     }
 
     #[test]

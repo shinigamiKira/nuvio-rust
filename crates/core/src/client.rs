@@ -7,13 +7,14 @@ use crate::addon::{self, CatalogDef, Manifest};
 use crate::cache::DiskCache;
 use crate::http::{Http, HttpError};
 use crate::meta::{self, CatalogPage, MetaDetails};
-use crate::stream::{self, Stream};
+use crate::stream::{self, AddonSubtitle, Stream};
 
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(12);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
 const META_TIMEOUT: Duration = Duration::from_secs(15);
 /// Addons that resolve debrid links on request are slow the first time (several seconds is normal).
 const STREAM_TIMEOUT: Duration = Duration::from_secs(40);
+const SUBTITLE_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// How many entries of a catalog the home shelves keep.
 pub const HOME_PREVIEW_ITEMS: usize = 40;
@@ -117,6 +118,16 @@ impl AddonClient {
     pub fn cached_meta(&self, manifest_url: &str, kind: &str, id: &str) -> Option<(MetaDetails, Duration)> {
         let hit = self.cache.get(&addon::resource_url(manifest_url, "meta", kind, id, None))?;
         Some((meta::parse_meta(&hit.bytes).ok()?, hit.age))
+    }
+
+    // -- subtitles -------------------------------------------------------------------------------------------------
+
+    /// Subtitle files an addon offers for a video. `filename` helps addons that match on the release name.
+    pub async fn subtitles(&self, source: &StreamSource, kind: &str, id: &str, filename: Option<&str>) -> Result<Vec<AddonSubtitle>, FetchError> {
+        let extra = filename.map(|f| addon::extra_segment(&[("filename", f)]));
+        let url = addon::resource_url(&source.manifest_url, "subtitles", kind, id, extra.as_deref());
+        let body = self.http.get_with_retry(&url, SUBTITLE_TIMEOUT).await?;
+        Ok(stream::parse_subtitles(&body, &source.name))
     }
 
     // -- streams ---------------------------------------------------------------------------------------------------

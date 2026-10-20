@@ -75,8 +75,6 @@ pub enum PillStyle {
     Primary,
     /// A translucent fill for secondary actions.
     Soft,
-    /// Outline only.
-    Outline,
 }
 
 /// A rounded button with an optional leading icon.
@@ -93,7 +91,6 @@ pub fn pill_button(ui: &mut Ui, icon: Option<char>, label: &str, style: PillStyl
     let (fill, stroke, fg) = match style {
         PillStyle::Primary => (lerp_color(t.accent, Color32::WHITE, 0.18 * hover), Color32::TRANSPARENT, t.on_accent),
         PillStyle::Soft => (with_alpha(Color32::WHITE, 0.10 + 0.08 * hover), Color32::TRANSPARENT, t.text),
-        PillStyle::Outline => (with_alpha(Color32::WHITE, 0.06 * hover), with_alpha(Color32::WHITE, 0.35 + 0.3 * hover), t.text),
     };
     let rect = rect.shrink(press * 1.5);
     ui.painter().rect_filled(rect, radius_of(radius::CHIP), fill);
@@ -298,6 +295,9 @@ impl PosterCard<'_> {
         }
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if let Some(backdrop) = self.item.background.as_deref() {
+                self.images.prefetch(backdrop, ui.ctx().content_rect().width() * ui.ctx().pixels_per_point());
+            }
         }
         response
     }
@@ -370,7 +370,7 @@ pub fn switch_row(ui: &mut Ui, title: &str, description: Option<&str>, value: &m
 pub fn text_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Response {
     let t = theme::get();
     let (rect, _) = ui.allocate_exact_size(vec2(width, 44.0), Sense::hover());
-    let id = ui.id().with(("text-field", hint));
+    let id = ui.make_persistent_id(("text-field", hint));
     let focused = ui.memory(|m| m.has_focus(id));
     let focus = animate(ui, id.with("focus"), focused, theme::motion::FAST);
     ui.painter().rect_filled(rect, radius_of(radius::CHIP), with_alpha(Color32::WHITE, 0.07));

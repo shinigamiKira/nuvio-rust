@@ -47,7 +47,7 @@ pub struct Track {
 
 impl Track {
     pub fn label(&self) -> String {
-        let language = self.lang.as_deref().map(language_name).unwrap_or_default();
+        let language = self.lang.as_deref().map(language_label).unwrap_or_default();
         let mut parts: Vec<String> = Vec::new();
         if !language.is_empty() {
             parts.push(language);
@@ -74,7 +74,7 @@ impl Track {
 }
 
 /// ISO 639 codes mpv reports, in the languages people actually pick between.
-fn language_name(code: &str) -> String {
+pub fn language_label(code: &str) -> String {
     let name = match code.to_ascii_lowercase().as_str() {
         "eng" | "en" => "English",
         "spa" | "es" => "Spanish",
@@ -291,6 +291,7 @@ impl Player {
             // With keep-open mpv never sends END_FILE at the end; it parks on the last frame and raises this flag.
             ("eof-reached", Observe::Flag),
             ("hwdec-current", Observe::Text),
+            ("track-list", Observe::Text),
         ] {
             mpv.observe(name, kind);
         }
@@ -480,6 +481,11 @@ impl Player {
         self.state.error = Some(message);
     }
 
+    /// Loads a subtitle file from an addon and switches to it.
+    pub fn add_subtitle(&self, url: &str, title: &str, language: &str) {
+        let _ = self.mpv.command(&["sub-add", url, "select", title, language]);
+    }
+
     pub fn stop(&self) {
         let _ = self.mpv.command(&["stop"]);
     }
@@ -572,6 +578,11 @@ impl Player {
             ("eof-reached", Value::Flag(true)) if self.should_recover() => self.recover(),
             ("eof-reached", Value::Flag(reached)) => self.state.ended = *reached,
             ("hwdec-current", Value::Text(v)) => self.state.hwdec = v.clone(),
+            ("track-list", Value::Text(json)) => {
+                if let Ok(tracks) = serde_json::from_str::<Vec<Track>>(json) {
+                    self.state.tracks = tracks;
+                }
+            }
             _ => {}
         }
     }
@@ -589,11 +600,6 @@ impl Player {
         self.state.tracks.iter().filter(move |t| t.kind == kind)
     }
 
-    /// Re-reads the track list (after an external subtitle was added, for example).
-    pub fn reload_tracks(&mut self) {
-        self.refresh_tracks();
-    }
-
     pub fn render_error(&self) -> Option<String> {
         self.surface.failed.lock().ok().and_then(|f| f.clone())
     }
@@ -609,10 +615,6 @@ impl Player {
         .into()
     }
 
-    /// Frees the GL resources while the context is still current (window closing, leaving the player).
-    pub fn release_gl(&self) {
-        self.surface.release();
-    }
 }
 
 impl Drop for Player {

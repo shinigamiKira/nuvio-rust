@@ -92,6 +92,16 @@ impl Http {
         response.bytes().await.map(|b| b.to_vec()).map_err(map_error)
     }
 
+    /// Asks for the first byte of `url` and throws the answer away. Addons that resolve a debrid link when the stream is
+    /// first requested spend seconds on it; doing that while the pointer rests on the stream means it is done by the time
+    /// the player opens it.
+    pub async fn warm(&self, url: &str) {
+        let request = self.client.get(url).header("Range", "bytes=0-0").timeout(Duration::from_secs(20));
+        if let Err(error) = request.send().await {
+            tracing::debug!(error = %error.without_url(), "warm-up request failed");
+        }
+    }
+
     /// Like `get`, with one more try after a short pause when the failure looks temporary.
     pub async fn get_with_retry(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, HttpError> {
         match self.get(url, timeout).await {

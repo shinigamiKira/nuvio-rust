@@ -114,9 +114,16 @@ impl App {
 
     fn drain_messages(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
-            if let Msg::Torrent { request, result } = message {
-                self.torrent_ready(request, result);
-                continue;
+            match message {
+                Msg::Torrent { request, result } => {
+                    self.torrent_ready(request, result);
+                    continue;
+                }
+                Msg::Subtitles { request, entries } => {
+                    self.subtitles_arrived(request, entries);
+                    continue;
+                }
+                _ => {}
             }
             let meta_for_streams = match &message {
                 Msg::Meta { result: Ok(meta), .. } => Some(meta.clone()),
@@ -180,7 +187,6 @@ impl App {
                     self.state.save_library();
                     self.push_toast(if added { format!("{name} added to your library") } else { format!("{name} removed from your library") });
                 }
-                Action::Toast(text) => self.push_toast(text),
                 Action::AddAddon(url) => {
                     if self.state.add_addon(&self.svc, url) {
                         self.push_toast("Installing the addon…");
@@ -244,7 +250,6 @@ impl App {
             request: 0,
             groups: Vec::new(),
             selection: Default::default(),
-            started: Instant::now(),
         };
         self.state.open_streams(&self.svc, state);
         let request = self.state.streams.as_ref().map(|s| s.request).unwrap_or(0);
@@ -284,7 +289,6 @@ impl App {
             request: 0,
             groups: Vec::new(),
             selection: Default::default(),
-            started: Instant::now(),
         };
         self.state.open_streams(&self.svc, state);
         self.routes.push(Route::Streams);
@@ -326,7 +330,10 @@ impl App {
             subtitles: request.stream.subtitles.iter().map(|s| s.url.clone()).collect(),
         });
         let meta = self.state.details.as_ref().and_then(|d| d.meta.ready().cloned()).filter(|m| m.id == request.title_id);
-        self.session = Some(Session::new(player, request, meta));
+        let subtitles_request = self.fetch_subtitles(&request);
+        let mut session = Session::new(player, request, meta);
+        session.subtitles_request = subtitles_request;
+        self.session = Some(session);
         self.auto_pick = None;
         if !matches!(self.current(), Route::Player) {
             self.routes.push(Route::Player);
@@ -356,7 +363,9 @@ impl App {
             season: request.video.as_ref().and_then(|v| v.season),
             episode: request.video.as_ref().and_then(|v| v.episode),
         };
+        let subtitles_request = self.fetch_subtitles(&request);
         let mut session = Session::new(player, request, meta);
+        session.subtitles_request = subtitles_request;
         session.torrent = Some(Torrent { request: torrent_request, status: status.clone(), info_hash });
         self.session = Some(session);
         self.auto_pick = None;
@@ -371,6 +380,36 @@ impl App {
             };
             Msg::Torrent { request: torrent_request, result }
         });
+    }
+
+    /// Asks the addons that serve subtitles for what they have for this video. Answers arrive as `Msg::Subtitles`.
+    fn fetch_subtitles(&mut self, request: &PlayRequest) -> u64 {
+        let id = self.state.request_id();
+        for source in self.state.subtitle_sources(&request.kind, &request.video_id) {
+            let (client, kind, video_id, filename) = (self.svc.client.clone(), request.kind.clone(), request.video_id.clone(), request.stream.filename.clone());
+            self.svc.spawn(async move {
+                let entries = client.subtitles(&source, &kind, &video_id, filename.as_deref()).await.unwrap_or_default();
+                Msg::Subtitles { request: id, entries }
+            });
+        }
+        id
+    }
+
+    fn subtitles_arrived(&mut self, request: u64, entries: Vec<nuvio_core::stream::AddonSubtitle>) {
+        let preferred = self.state.settings.preferred_subtitle_language.clone();
+        let wanted = self.state.settings.subtitles_on;
+        let Some(session) = self.session.as_mut().filter(|s| s.subtitles_request == request) else { return };
+        session.online_subtitles.extend(entries);
+        // With subtitles switched on by default and none in the file in that language, take the first one an addon has.
+        let has_selected = session.player.tracks_of("sub").any(|t| t.selected);
+        if wanted && !has_selected && !session.subtitle_chosen && !preferred.is_empty() {
+            let wanted_name = crate::player::language_label(&preferred);
+            if let Some(subtitle) = session.online_subtitles.iter().find(|s| crate::player::language_label(&s.language) == wanted_name).cloned() {
+                session.subtitle_chosen = true;
+                let label = format!("{} · {}", wanted_name, subtitle.addon);
+                session.player.add_subtitle(&subtitle.url, &label, &subtitle.language);
+            }
+        }
     }
 
     /// The loopback URL of a torrent arrived: hand it to the player.
@@ -534,7 +573,6 @@ impl App {
                     request: 0,
                     groups: Vec::new(),
                     selection: Default::default(),
-                    started: Instant::now(),
                 };
                 self.state.open_streams(&self.svc, state);
                 self.routes.push(Route::Streams);
@@ -663,6 +701,10 @@ impl eframe::App for App {
             self.actions.push(Action::Back);
         }
 
+        if route == Route::Tab(Tab::Home) && ctx.input(|i| i.key_pressed(egui::Key::F5) || (i.modifiers.command && i.key_pressed(egui::Key::R))) {
+            self.state.refresh_home(&self.svc);
+            self.push_toast("Refreshing Home…");
+        }
         self.run_auto_pick(&ctx);
         self.save_progress(false);
         self.drive_tests(&ctx);

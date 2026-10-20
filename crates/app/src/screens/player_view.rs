@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, CursorIcon, Key, Popup, Rect, Sense, Ui, pos2, vec2};
 use nuvio_core::meta::{MetaDetails, Video};
+use nuvio_core::stream::AddonSubtitle;
 
 use super::{Action, PlayRequest};
 use crate::icons;
@@ -53,6 +54,11 @@ pub struct Torrent {
 pub struct Session {
     pub player: Player,
     pub torrent: Option<Torrent>,
+    /// Subtitle files addons offered for this video, filled in a moment after the player opens.
+    pub online_subtitles: Vec<AddonSubtitle>,
+    pub subtitles_request: u64,
+    /// Whether the preferred subtitle language was already switched on from an addon's list.
+    pub subtitle_chosen: bool,
     pub request: PlayRequest,
     pub meta: Option<Arc<MetaDetails>>,
     last_motion: Instant,
@@ -71,6 +77,9 @@ impl Session {
         Self {
             player,
             torrent: None,
+            online_subtitles: Vec::new(),
+            subtitles_request: 0,
+            subtitle_chosen: false,
             request,
             meta,
             last_motion: Instant::now(),
@@ -374,7 +383,7 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
     // Bottom: buttons.
     let y = rect.bottom() - 48.0;
     let mut x = bar_left;
-    let mut button = |ui: &mut Ui, x: &mut f32, icon: char, tip: &str, px: f32| -> bool {
+    let button = |ui: &mut Ui, x: &mut f32, icon: char, tip: &str, px: f32| -> bool {
         let r = Rect::from_center_size(pos2(*x + 24.0, y), vec2(48.0, 48.0));
         let resp = ui.interact(r, egui::Id::unique(("player-btn", tip)), Sense::click());
         let h = animate(ui, resp.id.with("h"), resp.hovered(), theme::motion::FAST);
@@ -423,7 +432,7 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
 
     // Right side, from the edge inwards.
     let mut rx = bar_right;
-    let mut right_button = |ui: &mut Ui, rx: &mut f32, icon: char, tip: &str| -> egui::Response {
+    let right_button = |ui: &mut Ui, rx: &mut f32, icon: char, tip: &str| -> egui::Response {
         let r = Rect::from_center_size(pos2(*rx - 24.0, y), vec2(48.0, 48.0));
         let resp = ui.interact(r, egui::Id::unique(("player-btn", tip)), Sense::click());
         let h = animate(ui, resp.id.with("h"), resp.hovered(), theme::motion::FAST);
@@ -481,6 +490,8 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
     });
     let subtitles = right_button(ui, &mut rx, icons::SUBTITLES, "Subtitles");
     let sub_tracks: Vec<Track> = session.player.tracks_of("sub").cloned().collect();
+    // Embedded and already loaded tracks are listed above; offer each online file once per language and addon.
+    let online: Vec<AddonSubtitle> = session.online_subtitles.iter().filter(|s| !sub_tracks.iter().any(|t| t.external && t.title.as_deref().is_some_and(|title| title.contains(&s.addon)) && t.lang.as_deref() == Some(s.language.as_str()))).take(40).cloned().collect();
     Popup::menu(&subtitles).gap(10.0).align(egui::RectAlign::TOP).show(|ui| {
         ui.set_min_width(280.0);
         if menu_row(ui, "Off", sub_tracks.iter().all(|t| !t.selected)).clicked() {
@@ -492,6 +503,16 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
         for track in &sub_tracks {
             if menu_row(ui, &track.label(), track.selected).clicked() {
                 session.player.select_subtitle(Some(track.id));
+            }
+        }
+        if !online.is_empty() {
+            ui.add_space(6.0);
+            menu_note(ui, "From your addons");
+            for subtitle in &online {
+                let label = format!("{} · {}", crate::player::language_label(&subtitle.language), subtitle.addon);
+                if menu_row(ui, &label, false).clicked() {
+                    session.player.add_subtitle(&subtitle.url, &label, &subtitle.language);
+                }
             }
         }
     });

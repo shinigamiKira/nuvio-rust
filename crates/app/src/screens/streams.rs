@@ -117,15 +117,48 @@ fn panel_contents(cx: &mut Cx, ui: &mut Ui) {
 
     ScrollArea::vertical().id_salt("stream-list").auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 10.0;
-        for stream in &streams {
-            if stream_card(ui, stream).clicked() {
+        let mut hovered = None;
+        for (index, stream) in streams.iter().enumerate() {
+            let response = stream_card(ui, stream);
+            if response.hovered() {
+                hovered = Some(index);
+            }
+            if response.clicked() {
                 if let Some(request) = play_request(cx, stream) {
                     cx.actions.push(Action::Play(Box::new(request)));
                 }
             }
         }
+        warm_hovered(cx, ui, &streams, hovered);
         ui.add_space(8.0);
     });
+}
+
+/// Once the pointer has rested on a stream for a moment, ask its server for a byte so the link is resolved by the time the
+/// stream is chosen.
+fn warm_hovered(cx: &mut Cx, ui: &Ui, streams: &[Stream], hovered: Option<usize>) {
+    const REST: std::time::Duration = std::time::Duration::from_millis(350);
+    let Some(index) = hovered else {
+        cx.view.hovered_stream = None;
+        return;
+    };
+    let since = match cx.view.hovered_stream {
+        Some((previous, since)) if previous == index => since,
+        _ => {
+            cx.view.hovered_stream = Some((index, std::time::Instant::now()));
+            ui.ctx().request_repaint_after(REST);
+            return;
+        }
+    };
+    if since.elapsed() < REST {
+        ui.ctx().request_repaint_after(REST - since.elapsed());
+        return;
+    }
+    let Some(url) = streams.get(index).and_then(Stream::direct_url) else { return };
+    if cx.view.warmed.insert(url.to_owned()) {
+        let (http, url) = (cx.svc.client.http().clone(), url.to_owned());
+        cx.svc.runtime.spawn(async move { http.warm(&url).await });
+    }
 }
 
 fn play_request(cx: &Cx, stream: &Stream) -> Option<PlayRequest> {
