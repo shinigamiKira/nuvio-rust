@@ -586,6 +586,8 @@ impl State {
             }
             Msg::Subtitles { .. } => {}
             Msg::KotlinAddons(urls) => self.kotlin_addons = urls,
+            // Torrent streams belong to the player session, which the app owns.
+            Msg::Torrent { .. } => {}
         }
     }
 

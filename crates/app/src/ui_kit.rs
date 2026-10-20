@@ -227,7 +227,9 @@ pub fn horizontal_gradient(ui: &Ui, rect: Rect, left: Color32, right: Color32) {
 pub fn glass_panel(ui: &Ui, rect: Rect, corner: f32, strength: f32) {
     let shadow = egui::Shadow { offset: [0, 10], blur: 30, spread: 0, color: Color32::from_black_alpha((110.0 * strength) as u8) };
     ui.painter().add(shadow.as_shape(rect, radius_of(corner)));
-    ui.painter().rect_filled(rect, radius_of(corner), Color32::from_rgba_unmultiplied(18, 18, 20, (190.0 * strength) as u8));
+    // The blurred picture of what is behind the panel, then a dark wash over it for legibility.
+    crate::glass::backdrop(ui, rect, corner, strength);
+    ui.painter().rect_filled(rect, radius_of(corner), Color32::from_rgba_unmultiplied(14, 14, 18, (128.0 * strength) as u8));
     // The lit top edge: a bright hairline fading out down the sides.
     ui.painter().rect_stroke(rect, radius_of(corner), Stroke::new(1.0, Color32::from_white_alpha((34.0 * strength) as u8)), StrokeKind::Inside);
     let span = (rect.width() - corner * 2.0).max(0.0);

@@ -17,7 +17,7 @@ use tokio::runtime::Handle;
 use crate::args::Args;
 use crate::images::Images;
 use crate::player::{Player, Source};
-use crate::screens::player_view::{self, Session};
+use crate::screens::player_view::{self, Session, Torrent};
 use crate::screens::{self, Action, Cx, PlayRequest, Route, Tab, ViewState, nav};
 use crate::services::{Msg, Services};
 use crate::state::{State, StreamsState};
@@ -42,6 +42,9 @@ pub struct App {
     window: Option<WindowState>,
     auto_pick: Option<AutoPick>,
     opened_from_args: bool,
+    keys_fired: Vec<usize>,
+    logged_first_frame: bool,
+    logged_first_content: bool,
 }
 
 /// After "next episode": play the stream that matches the one just watched as soon as the addon lists it.
@@ -84,6 +87,9 @@ impl App {
             window: None,
             auto_pick: None,
             opened_from_args: false,
+            keys_fired: Vec::new(),
+            logged_first_frame: false,
+            logged_first_content: false,
         };
         app.state.start_addons(&app.svc);
         if let Some(url) = app.args.play.clone() {
@@ -93,8 +99,25 @@ impl App {
         app
     }
 
+    /// Timing lines for the startup budget: first frame, and first poster shelf with content.
+    fn log_milestones(&mut self) {
+        let since_start = || crate::START.get().map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
+        if !self.logged_first_frame {
+            self.logged_first_frame = true;
+            tracing::info!(ms = since_start(), "first frame");
+        }
+        if !self.logged_first_content && self.state.sections.iter().any(|s| !s.items.is_empty()) {
+            self.logged_first_content = true;
+            tracing::info!(ms = since_start(), "first shelf with titles");
+        }
+    }
+
     fn drain_messages(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
+            if let Msg::Torrent { request, result } = message {
+                self.torrent_ready(request, result);
+                continue;
+            }
             let meta_for_streams = match &message {
                 Msg::Meta { result: Ok(meta), .. } => Some(meta.clone()),
                 _ => None,
@@ -273,8 +296,8 @@ impl App {
             Some(Playback::Url(url)) => {
                 self.start_player(ctx, request.clone(), url);
             }
-            Some(Playback::Torrent { .. }) => {
-                self.push_toast("This is a torrent stream. The built-in P2P engine is not part of this build yet.");
+            Some(Playback::Torrent { info_hash, file_idx, trackers }) => {
+                self.start_torrent(ctx, request.clone(), info_hash, file_idx, trackers);
             }
             Some(Playback::External(url)) => {
                 open_in_browser(&url);
@@ -310,10 +333,79 @@ impl App {
         }
     }
 
+    /// A torrent: the player opens now (its video surface has to exist before a file loads), and the file follows when
+    /// the swarm has been found and the first pieces chosen.
+    fn start_torrent(&mut self, ctx: &egui::Context, request: PlayRequest, info_hash: String, file_idx: Option<i64>, trackers: Vec<String>) {
+        let settings = &self.state.settings;
+        let mut player = match Player::new(ctx, settings.hardware_decoding) {
+            Ok(player) => player,
+            Err(error) => {
+                self.push_toast(format!("The player could not start: {error}"));
+                return;
+            }
+        };
+        player.set_volume(settings.volume);
+        player.set_track_preferences(&settings.preferred_audio_language, &settings.preferred_subtitle_language, settings.subtitles_on);
+        let meta = self.state.details.as_ref().and_then(|d| d.meta.ready().cloned()).filter(|m| m.id == request.title_id);
+        let torrent_request = self.state.request_id();
+        let status = crate::p2p::Status::new();
+        let wanted = crate::p2p::Request {
+            info_hash: info_hash.clone(),
+            trackers,
+            file_index: file_idx.and_then(|i| usize::try_from(i).ok()),
+            season: request.video.as_ref().and_then(|v| v.season),
+            episode: request.video.as_ref().and_then(|v| v.episode),
+        };
+        let mut session = Session::new(player, request, meta);
+        session.torrent = Some(Torrent { request: torrent_request, status: status.clone(), info_hash });
+        self.session = Some(session);
+        self.auto_pick = None;
+        if !matches!(self.current(), Route::Player) {
+            self.routes.push(Route::Player);
+        }
+        let svc = self.svc.clone();
+        self.svc.spawn(async move {
+            let result = match svc.engine().await {
+                Ok(engine) => engine.open(&wanted, &status).await.map_err(|e| format!("{e:#}")),
+                Err(error) => Err(error),
+            };
+            Msg::Torrent { request: torrent_request, result }
+        });
+    }
+
+    /// The loopback URL of a torrent arrived: hand it to the player.
+    fn torrent_ready(&mut self, request: u64, result: Result<String, String>) {
+        let start_override = self.args.start;
+        let Some(session) = self.session.as_mut().filter(|s| s.torrent.as_ref().is_some_and(|t| t.request == request)) else {
+            return;
+        };
+        match result {
+            Ok(url) => {
+                let resume = self.state.progress.get(&session.request.video_id).filter(|p| p.is_resumable()).map(|p| p.position).unwrap_or(0.0);
+                session.player.open(Source {
+                    url,
+                    start: if start_override > 0.0 { start_override } else { resume },
+                    headers: Vec::new(),
+                    subtitles: session.request.stream.subtitles.iter().map(|s| s.url.clone()).collect(),
+                });
+            }
+            Err(error) => session.player.fail(error),
+        }
+    }
+
     /// Records how far the viewer got and releases the player.
     fn stop_session(&mut self) {
         self.save_progress(true);
         if let Some(session) = self.session.take() {
+            if let Some(torrent) = &session.torrent {
+                torrent.status.stop();
+                let (svc, hash) = (self.svc.clone(), torrent.info_hash.clone());
+                self.svc.runtime.spawn(async move {
+                    if let Some(engine) = svc.engine_if_started() {
+                        engine.close(&hash).await;
+                    }
+                });
+            }
             self.state.settings.volume = session.player.state.volume;
             self.state.save_settings();
             session.player.stop();
@@ -395,7 +487,7 @@ impl App {
             video: None,
             stream: Stream { url: Some(url.clone()), ..Stream::default() },
         };
-        self.start_player(ctx, request, url);
+        self.play(ctx, request);
     }
 
     // -- development hooks (see args.rs) -----------------------------------------------------------------------------
@@ -535,6 +627,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.log_milestones();
         self.drain_messages();
         self.svc.images.begin_frame();
         if !self.opened_from_args {
@@ -586,10 +679,39 @@ impl eframe::App for App {
             raw_input.events.push(egui::Event::PointerMoved(Pos2::new(x + nudge, y)));
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+        let elapsed = self.started.elapsed().as_secs_f64();
+        for (index, (at, name)) in self.args.keys.iter().enumerate() {
+            if elapsed >= *at && !self.keys_fired.contains(&index) {
+                self.keys_fired.push(index);
+                if let Some(key) = egui::Key::from_name(name) {
+                    for pressed in [true, false] {
+                        raw_input.events.push(egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE });
+                    }
+                }
+            }
+        }
+        for (index, (at, x, y)) in self.args.clicks.iter().enumerate() {
+            let slot = 1000 + index;
+            if elapsed >= *at && !self.keys_fired.contains(&slot) {
+                self.keys_fired.push(slot);
+                let pos = Pos2::new(*x, *y);
+                raw_input.events.push(egui::Event::PointerMoved(pos));
+                for pressed in [true, false] {
+                    raw_input.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                }
+            }
+        }
+        if !self.args.keys.is_empty() || !self.args.clicks.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_session();
+        // Let the torrent engine save its DHT table; a few seconds is all it gets.
+        if let Some(engine) = self.svc.engine_if_started() {
+            let _ = self.svc.runtime.block_on(async { tokio::time::timeout(Duration::from_secs(3), engine.shutdown()).await });
+        }
         if let Some(window) = self.window {
             self.state.settings.window = Some(window);
         }

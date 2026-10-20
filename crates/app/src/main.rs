@@ -2,19 +2,29 @@
 
 mod app;
 mod args;
+mod glass;
 mod icons;
 mod images;
 mod logging;
+mod p2p;
 mod player;
 mod screens;
 mod services;
 mod state;
 mod theme;
 mod ui_kit;
+mod window;
+
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use eframe::egui;
 
+/// When the process started, for the timing lines in the log.
+pub static START: OnceLock<Instant> = OnceLock::new();
+
 fn main() -> anyhow::Result<()> {
+    START.get_or_init(Instant::now);
     let args = args::Args::parse();
     if let Some(dir) = &args.data_dir {
         nuvio_core::paths::use_data_dir(dir.clone());
@@ -28,21 +38,12 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let (width, height) = args.size.unwrap_or((1280.0, 800.0));
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Nuvio")
-        .with_inner_size([width, height])
-        .with_min_inner_size([960.0, 600.0])
-        .with_fullscreen(args.fullscreen);
+    let saved = nuvio_core::store::JsonFile::<nuvio_core::store::Settings>::new("settings.json").load().window;
+    let (mut viewport, centered) = window::initial_viewport(args.fullscreen, args.size, saved);
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions {
-        viewport,
-        centered: true,
-        multisampling: 0,
-        ..Default::default()
-    };
+    let options = eframe::NativeOptions { viewport, centered, multisampling: 0, ..Default::default() };
     let handle = runtime.handle().clone();
     eframe::run_native(
         "Nuvio",

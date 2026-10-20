@@ -43,8 +43,16 @@ impl Aspect {
     ];
 }
 
+/// A torrent stream being prepared or played: the numbers to show, and what to remove afterwards.
+pub struct Torrent {
+    pub request: u64,
+    pub status: crate::p2p::Status,
+    pub info_hash: String,
+}
+
 pub struct Session {
     pub player: Player,
+    pub torrent: Option<Torrent>,
     pub request: PlayRequest,
     pub meta: Option<Arc<MetaDetails>>,
     last_motion: Instant,
@@ -62,6 +70,7 @@ impl Session {
     pub fn new(player: Player, request: PlayRequest, meta: Option<Arc<MetaDetails>>) -> Self {
         Self {
             player,
+            torrent: None,
             request,
             meta,
             last_motion: Instant::now(),
@@ -191,7 +200,9 @@ pub fn show(session: &mut Session, ui: &mut Ui, actions: &mut Vec<Action>, fulls
         let center = rect.center();
         ui.painter().circle_filled(center, 38.0, Color32::from_black_alpha(130));
         ui_kit::spinner(ui, center, 18.0, Color32::WHITE);
-        let text = if !state.started {
+        let text = if let (false, Some(torrent)) = (state.started, &session.torrent) {
+            torrent_text(&torrent.status.snapshot())
+        } else if !state.started {
             "Opening stream…".to_owned()
         } else if state.buffer_percent > 0 {
             format!("Buffering {}%", state.buffer_percent)
@@ -202,7 +213,11 @@ pub fn show(session: &mut Session, ui: &mut Ui, actions: &mut Vec<Action>, fulls
     }
 
     // --- errors -----------------------------------------------------------------------------------------------------
-    let error = state.error.clone().or_else(|| session.player.render_error());
+    let torrent_error = session.torrent.as_ref().and_then(|t| match t.status.snapshot().phase {
+        crate::p2p::Phase::Failed(error) => Some(error),
+        _ => None,
+    });
+    let error = state.error.clone().or(torrent_error).or_else(|| session.player.render_error());
     if let Some(error) = error {
         error_card(ui, rect, &error, actions);
     }
@@ -217,6 +232,22 @@ pub fn show(session: &mut Session, ui: &mut Ui, actions: &mut Vec<Action>, fulls
     }
     next_episode_card(session, ui, rect, actions, auto_play_next);
     let _ = &t;
+}
+
+fn torrent_text(snapshot: &crate::p2p::Snapshot) -> String {
+    use crate::p2p::Phase;
+    let megabytes = |bytes: f64| bytes / 1_048_576.0;
+    match &snapshot.phase {
+        Phase::FindingPeers if snapshot.peers == 0 => "Looking for peers…".to_owned(),
+        Phase::FindingPeers => format!("Looking for the file list · {} peers", snapshot.peers),
+        Phase::Buffering | Phase::Failed(_) => format!(
+            "Downloading the start · {} peers · {:.1} MB/s · {:.0} of {:.0} MB",
+            snapshot.peers,
+            megabytes(snapshot.download_bytes_per_sec),
+            megabytes(snapshot.downloaded as f64),
+            megabytes(snapshot.file_size as f64)
+        ),
+    }
 }
 
 fn handle_keys(session: &mut Session, ctx: &egui::Context, actions: &mut Vec<Action>, fullscreen: bool) {
@@ -606,6 +637,11 @@ fn stats(session: &mut Session, ui: &mut Ui, rect: Rect) {
         ("Buffer", format!("{:.1} s ahead, {:.1} MB/s", p.state.cached_secs, p.property("cache-speed").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) / 1_048_576.0)),
         ("Frames", format!("{} dropped, {} delayed", get("frame-drop-count"), get("vo-delayed-frame-count"))),
     ];
+    let torrent_line = session.torrent.as_ref().map(|t| {
+        let s = t.status.snapshot();
+        ("Torrent", format!("{} peers, {:.1} MB/s", s.peers, s.download_bytes_per_sec / 1_048_576.0))
+    });
+    let lines: Vec<(&str, String)> = lines.into_iter().chain(torrent_line).collect();
     let t = theme::get();
     let panel = Rect::from_min_size(rect.right_top() + vec2(-390.0, 92.0), vec2(366.0, 28.0 + lines.len() as f32 * 24.0));
     ui.painter().rect_filled(panel, radius_of(14.0), Color32::from_black_alpha(205));

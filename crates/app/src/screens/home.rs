@@ -80,7 +80,8 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
         view.hero_index = (view.hero_index + 1) % items.len();
         view.hero_since = std::time::Instant::now();
     }
-    ui.ctx().request_repaint_after(Duration::from_millis(500));
+    // Wake up when the next slide is due, not before: an idle home screen should cost nothing.
+    ui.ctx().request_repaint_after(HERO_INTERVAL.saturating_sub(view.hero_since.elapsed()) + Duration::from_millis(30));
     let item = &items[view.hero_index];
 
     let bottom = CornerRadius { nw: 0, ne: 0, sw: 28, se: 28 };
@@ -317,7 +318,7 @@ fn shelf(cx: &mut Cx, ui: &mut Ui, index: usize, pad: f32) {
 
     let content_w = output.content_size.x;
     let view_w = output.inner_rect.width();
-    let offset = output.state.offset().x;
+    let offset = output.state.clamped_offset().x;
     // Ask for the next page when the end is near.
     if has_more && offset + view_w > content_w - card_w * 3.0 {
         cx.state.load_more(cx.svc, &key);

@@ -27,6 +27,10 @@ pub struct Args {
     pub mouse: Option<(f32, f32)>,
     /// `--select <n>`: with `--open streams:...`, play the n-th stream of the list.
     pub select: Option<usize>,
+    /// `--key <seconds>:<Key>`, repeatable: press a key (egui names: `Space`, `ArrowUp`, `F`) after a while.
+    pub keys: Vec<(f64, String)>,
+    /// `--click <seconds>:<x>,<y>`, repeatable: click there after a while (points, not pixels).
+    pub clicks: Vec<(f64, f32, f32)>,
 }
 
 impl Args {
@@ -55,6 +59,20 @@ impl Args {
                     args.mouse = text.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)));
                 }
                 "--select" => args.select = value().parse().ok(),
+                "--key" => {
+                    let text = value();
+                    if let Some((at, key)) = text.split_once(':') {
+                        args.keys.push((at.parse().unwrap_or(0.0), key.to_owned()));
+                    }
+                }
+                "--click" => {
+                    let text = value();
+                    let parsed = text.split_once(':').and_then(|(at, pos)| {
+                        let (x, y) = pos.split_once(',')?;
+                        Some((at.parse().ok()?, x.parse().ok()?, y.parse().ok()?))
+                    });
+                    args.clicks.extend(parsed);
+                }
                 other => eprintln!("unknown option {other}"),
             }
         }

@@ -16,6 +16,9 @@ const REBUFFER_SECS: u32 = 5;
 const DV_FILTER_WIDTH: i64 = 1920;
 /// How long to wait for mpv to report what the filter chain produced.
 const DV_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
+/// mpv's HTTP stream retries an interrupted transfer a few times and then reports end of file. When that happens far
+/// from the end, the stream is opened again where it stopped, this many times before giving up.
+const MAX_RECOVERIES: u32 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
@@ -66,7 +69,7 @@ impl Track {
                 });
             }
         }
-        if parts.is_empty() { format!("Track {}", self.id) } else { parts.join(" Â· ") }
+        if parts.is_empty() { format!("Track {}", self.id) } else { parts.join(" Ã‚Â· ") }
     }
 }
 
@@ -218,6 +221,9 @@ pub struct Player {
     mpv: Arc<Mpv>,
     hardware_decoding: bool,
     source: Option<Source>,
+    /// The per-file options of the current load, kept so a recovery reopens the file the same way.
+    last_extra: Vec<String>,
+    recoveries: u32,
     dolby_vision: DolbyVision,
     surface: Arc<Surface>,
     pub state: State,
@@ -282,6 +288,8 @@ impl Player {
             ("mute", Observe::Flag),
             ("speed", Observe::Double),
             ("seeking", Observe::Flag),
+            // With keep-open mpv never sends END_FILE at the end; it parks on the last frame and raises this flag.
+            ("eof-reached", Observe::Flag),
             ("hwdec-current", Observe::Text),
         ] {
             mpv.observe(name, kind);
@@ -297,6 +305,8 @@ impl Player {
             mpv,
             hardware_decoding,
             source: None,
+            last_extra: Vec::new(),
+            recoveries: 0,
             dolby_vision: DolbyVision::Unchecked,
             surface,
             state: State { volume: 100.0, speed: 1.0, ..State::default() },
@@ -322,7 +332,7 @@ impl Player {
     fn start_pending(&mut self) {
         let Some(source) = self.pending.take() else { return };
         self.dolby_vision = DolbyVision::Unchecked;
-        self.opened = Instant::now();
+        self.recoveries = 0;
         let start = source.start;
         self.load(&source, &[], start);
         self.source = Some(source);
@@ -330,8 +340,10 @@ impl Player {
 
     /// Sends the file to mpv. `extra` are per-file options (a filter, a decoder) that only apply to this load.
     fn load(&mut self, source: &Source, extra: &[String], start: f64) {
+        self.opened = Instant::now();
         self.state = State { volume: self.state.volume, muted: self.state.muted, speed: 1.0, ..State::default() };
         self.rebuffer_raised = false;
+        self.last_extra = extra.to_vec();
         let _ = self.mpv.set_str("cache-pause-wait", &START_BUFFER_SECS.to_string());
         let headers: Vec<String> = source.headers.iter().map(|(name, value)| format!("{name}: {value}")).collect();
         let _ = self.mpv.set_str("http-header-fields", &headers.join(","));
@@ -463,6 +475,11 @@ impl Player {
         let _ = self.mpv.set_str("sid", if subtitles_on { "auto" } else { "no" });
     }
 
+    /// Shows an error card instead of the picture (a torrent that could not be opened).
+    pub fn fail(&mut self, message: String) {
+        self.state.error = Some(message);
+    }
+
     pub fn stop(&self) {
         let _ = self.mpv.command(&["stop"]);
     }
@@ -501,6 +518,7 @@ impl Player {
                     }
                 }
                 Event::EndFile { reason, error } => match reason {
+                    EndReason::Eof | EndReason::Error if self.should_recover() => self.recover(),
                     EndReason::Eof => self.state.ended = true,
                     EndReason::Error => self.state.error = Some(error.clone().unwrap_or_else(|| "Playback failed".into())),
                     _ => {}
@@ -522,6 +540,21 @@ impl Player {
         self.verify_dolby_vision();
     }
 
+    /// A network stream that ends long before its duration was cut off, not finished.
+    fn should_recover(&self) -> bool {
+        let remote = self.source.as_ref().is_some_and(|s| s.url.starts_with("http"));
+        remote && self.state.started && self.recoveries < MAX_RECOVERIES && self.state.duration > 30.0 && self.state.position < self.state.duration - 20.0
+    }
+
+    fn recover(&mut self) {
+        let Some(source) = self.source.clone() else { return };
+        self.recoveries += 1;
+        let at = self.state.position;
+        tracing::warn!(attempt = self.recoveries, position = at as u64, "the stream ended early, opening it again");
+        let extra = self.last_extra.clone();
+        self.load(&source, &extra, at);
+    }
+
     fn apply_property(&mut self, name: &str, value: &Value) {
         match (name, value) {
             ("time-pos", v) => self.state.position = v.as_f64().unwrap_or(self.state.position),
@@ -536,6 +569,8 @@ impl Player {
             ("mute", Value::Flag(v)) => self.state.muted = *v,
             ("speed", v) => self.state.speed = v.as_f64().unwrap_or(1.0),
             ("seeking", Value::Flag(v)) => self.state.seeking = *v,
+            ("eof-reached", Value::Flag(true)) if self.should_recover() => self.recover(),
+            ("eof-reached", Value::Flag(reached)) => self.state.ended = *reached,
             ("hwdec-current", Value::Text(v)) => self.state.hwdec = v.clone(),
             _ => {}
         }
