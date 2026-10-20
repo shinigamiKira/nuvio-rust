@@ -21,18 +21,19 @@ the Kotlin build through its player harness (the same libmpv, its Direct3D 11 re
 | --- | --- | --- |
 | Installer | 167.5 MB | 42.2 MB |
 | Installed | 357 MB | 135 MB (libmpv is 122 of them) |
-| Window with content, warm cache | first frame 1.8-1.9 s, first image 3.2 s | first frame 0.21-0.23 s, first shelf of posters the same moment |
-| Window with content, empty cache | | first frame 0.20 s, first shelf 0.68 s |
-| Working set on Home, idle | 428-439 MB | 185 MB |
-| Frames drawn on an idle Home | | none between banner slides (a slide costs about half a second of one core) |
-| CPU, 2160p HEVC 10-bit 30 fps | 0.29 cores (median) | 0.36 cores |
-| CPU, 2160p H.264 30 fps, 41 Mbit/s | 0.35 cores | 0.32 cores |
-| CPU, 1080p H.264 30 fps | 0.27 cores | 0.29 cores |
+| Window with content, warm cache | first frame 1.8-1.9 s, first image 3.2 s | first frame 0.23 s, the shelves of the last session in the same frame |
+| Window with content, empty cache | | first frame 0.25 s, first shelf 0.7-1.7 s (the network) |
+| Working set on Home, idle | 428-439 MB | 126-185 MB |
+| CPU on Home, idle | | 0.08 % of a core: no frames are drawn |
+| CPU, 2160p HEVC 10-bit 30 fps | 0.29 cores (median) | 0.11 cores (0.08-0.15 over four runs) |
+| CPU, 2160p H.264 30 fps, 41 Mbit/s | 0.35 cores | 0.07 cores |
+| CPU, 1080p H.264 30 fps | 0.27 cores | 0.06 cores |
 | Two minutes of 4K playback | | 792 to 800 MB working set, handle and thread counts flat |
 
-So: much smaller, a tenth of the start-up time and under half the memory, but **playback costs the same**. That is expected,
-because mpv does the work in both. Without NVIDIA the decoder falls back to copy-back decoding, which measured about 90 % of a core
-on the 2160p HEVC clip here (the Kotlin build's D3D11 renderer can keep D3D11VA zero-copy on any GPU; through OpenGL only NVDEC can).
+The Kotlin playback figures are its player harness (no application window around it), so the comparison favours it if anything.
+Both play through the same libmpv; the difference is where the frames go. This build draws one window frame per video frame, and
+NVDEC hands its frames to OpenGL without a copy. Without NVIDIA the decoder falls back to copy-back decoding, which measured about 90 % of
+a core on the 2160p HEVC clip here (the Kotlin build's D3D11 renderer can keep D3D11VA zero-copy on any GPU; through OpenGL only NVDEC can).
 Memory is the working set; with NVDEC the process also holds about 2 GB of address space for CUDA, which is not physical memory.
 
 Where the start-up and memory difference comes from, none of it clever:
@@ -40,7 +41,9 @@ Where the start-up and memory difference comes from, none of it clever:
 * a single exe has no runtime to warm up, and the last session's shelves are read from the disk cache and shown before the network
   answers;
 * posters are decoded off the UI thread and shrunk to the size they are drawn at (a Lanczos resize), then cached;
-* nothing repaints unless something changed;
+* nothing repaints unless something changed, and egui's `request_repaint()` draws two frames per call, so everything that wakes the
+  window (video frames, finished downloads, animations) asks for one frame after a short delay instead; that alone took a 2160p
+  file from 36 % to 12 % of a core;
 * NVDEC hands decoded frames to OpenGL without a copy.
 
 ## Build
