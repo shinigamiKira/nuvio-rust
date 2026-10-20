@@ -648,21 +648,12 @@ fn hud(session: &mut Session, ui: &mut Ui, rect: Rect) {
 }
 
 fn stats(session: &mut Session, ui: &mut Ui, rect: Rect) {
-    let p = &session.player;
-    let get = |name: &str| p.property(name).unwrap_or_else(|| "–".into());
-    let lines = [
-        ("Video", format!("{} {}×{} @ {} fps", get("video-codec"), get("video-params/w"), get("video-params/h"), get("container-fps"))),
-        ("Decoder", get("hwdec-current")),
-        ("Colour", format!("{} / {}", get("video-params/colormatrix"), get("video-params/gamma"))),
-        ("Audio", format!("{} {}", get("audio-codec-name"), get("audio-params/hr-channels"))),
-        ("Buffer", format!("{:.1} s ahead, {:.1} MB/s", p.state.cached_secs, p.property("cache-speed").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) / 1_048_576.0)),
-        ("Frames", format!("{} dropped, {} delayed", get("frame-drop-count"), get("vo-delayed-frame-count"))),
-    ];
-    let torrent_line = session.torrent.as_ref().map(|t| {
-        let s = t.status.snapshot();
-        ("Torrent", format!("{} peers, {:.1} MB/s", s.peers, s.download_bytes_per_sec / 1_048_576.0))
-    });
-    let lines: Vec<(&str, String)> = lines.into_iter().chain(torrent_line).collect();
+    let mut lines = session.player.stats();
+    lines.push(("Buffer", format!("{:.1} s ahead", session.player.state.cached_secs)));
+    if let Some(torrent) = &session.torrent {
+        let s = torrent.status.snapshot();
+        lines.push(("Torrent", format!("{} peers, {:.1} MB/s", s.peers, s.download_bytes_per_sec / 1_048_576.0)));
+    }
     let t = theme::get();
     let panel = Rect::from_min_size(rect.right_top() + vec2(-390.0, 92.0), vec2(366.0, 28.0 + lines.len() as f32 * 24.0));
     ui.painter().rect_filled(panel, radius_of(14.0), Color32::from_black_alpha(205));

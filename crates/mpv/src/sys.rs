@@ -121,7 +121,6 @@ api! {
     mpv_initialize: fn(Handle) -> c_int,
     mpv_terminate_destroy: fn(Handle),
     mpv_set_option_string: fn(Handle, *const c_char, *const c_char) -> c_int,
-    mpv_set_property_string: fn(Handle, *const c_char, *const c_char) -> c_int,
     mpv_get_property_string: fn(Handle, *const c_char) -> *mut c_char,
     mpv_get_property: fn(Handle, *const c_char, c_int, *mut c_void) -> c_int,
     mpv_set_property_async: fn(Handle, u64, *const c_char, c_int, *mut c_void) -> c_int,

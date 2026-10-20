@@ -30,6 +30,7 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
             ui.add_space(96.0);
         }
 
+        import_offer(cx, ui, pad);
         let resume: Vec<Progress> = cx.state.progress.continue_watching().into_iter().take(12).cloned().collect();
         if !resume.is_empty() {
             continue_watching(cx, ui, &resume, pad);
@@ -49,6 +50,35 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
 }
 
 /// The titles the hero rotates through: the first entries with a backdrop, one per title, across the shelves.
+/// First run next to an installed Nuvio for Windows (Kotlin): offer to bring its addons over, once.
+fn import_offer(cx: &mut Cx, ui: &mut Ui, pad: f32) {
+    let fresh = cx.state.kotlin_addons.iter().filter(|u| !cx.state.addon_list.contains(u)).count();
+    if fresh == 0 || cx.state.settings.import_prompt_dismissed {
+        return;
+    }
+    let t = theme::get();
+    let width = ui.available_width() - pad * 2.0;
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        let (rect, _) = ui.allocate_exact_size(vec2(width, 68.0), Sense::hover());
+        ui_kit::glass_panel(ui, rect, 22.0, 1.0);
+        let text = format!("Nuvio for Windows is installed with {fresh} addon{}. Bring {} over?", if fresh == 1 { "" } else { "s" }, if fresh == 1 { "it" } else { "them" });
+        ui_kit::draw_text(ui, rect.left_center() + vec2(24.0, 0.0), Align2::LEFT_CENTER, &text, theme::semibold(size::BODY_MD), t.text);
+        let mut buttons = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(rect.right_top() + vec2(-290.0, 12.0), vec2(270.0, 44.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        if ui_kit::pill_button(&mut buttons, Some(crate::icons::DOWNLOAD), "Import", PillStyle::Primary).clicked() {
+            cx.actions.push(Action::ImportKotlinAddons);
+            cx.state.settings.import_prompt_dismissed = true;
+            cx.state.save_settings();
+        }
+        buttons.add_space(8.0);
+        if ui_kit::pill_button(&mut buttons, None, "Not now", PillStyle::Soft).clicked() {
+            cx.state.settings.import_prompt_dismissed = true;
+            cx.state.save_settings();
+        }
+    });
+    ui.add_space(22.0);
+}
+
 fn hero_items(cx: &Cx) -> Vec<MetaPreview> {
     let mut seen = std::collections::HashSet::new();
     let mut picked = Vec::new();
@@ -259,7 +289,12 @@ fn shelf(cx: &mut Cx, ui: &mut Ui, index: usize, pad: f32) {
     };
     // Portrait posters get wider with the window, within a range that keeps the title readable.
     let card_w = (width / 8.4).clamp(150.0, 210.0);
-    let shape = if cx.state.sections[index].items.first().is_some_and(|i| i.shape == PosterShape::Landscape) { PosterShape::Landscape } else { PosterShape::Poster };
+    let own_shape = if cx.state.sections[index].items.first().is_some_and(|i| i.shape == PosterShape::Landscape) { PosterShape::Landscape } else { PosterShape::Poster };
+    let shape = match cx.state.settings.poster_style.as_str() {
+        "portrait" => PosterShape::Poster,
+        "landscape" => PosterShape::Landscape,
+        _ => own_shape,
+    };
     let card_w = if shape == PosterShape::Landscape { card_w * 1.45 } else { card_w };
     let row_h = ui_kit::card_size(shape, card_w).y + 44.0;
 

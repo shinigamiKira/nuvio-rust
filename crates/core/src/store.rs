@@ -211,6 +211,10 @@ pub struct Settings {
     pub preferred_audio_language: String,
     pub preferred_subtitle_language: String,
     pub subtitles_on: bool,
+    /// `auto` follows each catalog's own shape; `portrait` and `landscape` force one.
+    pub poster_style: String,
+    /// The offer to import addons from an installed Nuvio for Windows (Kotlin) was answered.
+    pub import_prompt_dismissed: bool,
     pub volume: f64,
     pub window: Option<WindowState>,
 }
@@ -227,6 +231,8 @@ impl Default for Settings {
             preferred_audio_language: String::new(),
             preferred_subtitle_language: "eng".into(),
             subtitles_on: false,
+            poster_style: "auto".into(),
+            import_prompt_dismissed: false,
             volume: 100.0,
             window: None,
         }

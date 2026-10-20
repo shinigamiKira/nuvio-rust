@@ -24,7 +24,9 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
 
     let wide = width >= 1080.0;
     let panel_w = if wide { (width * 0.56).min(820.0) } else { (width - pad * 2.0).min(820.0) };
-    let panel = Rect::from_min_max(pos2(screen.right() - pad.min(40.0) - panel_w, screen.top() + 24.0), pos2(screen.right() - pad.min(40.0), screen.bottom() - 24.0));
+    // Without the summary column the panel spans the window, so it starts below the back button.
+    let panel_top = screen.top() + if wide { 24.0 } else { 84.0 };
+    let panel = Rect::from_min_max(pos2(screen.right() - pad.min(40.0) - panel_w, panel_top), pos2(screen.right() - pad.min(40.0), screen.bottom() - 24.0));
 
     if wide {
         summary(cx, ui, screen, pad, panel.left() - 40.0);

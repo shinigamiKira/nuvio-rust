@@ -30,6 +30,7 @@ fn main() -> anyhow::Result<()> {
         nuvio_core::paths::use_data_dir(dir.clone());
     }
     logging::init();
+    install_panic_hook();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Nuvio starting");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -51,6 +52,22 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, args, handle)))),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// The release build aborts on a panic. The hook runs first: it writes the message to the log and tells the user where it
+/// is, instead of the window just vanishing.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let message = info.payload().downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
+        tracing::error!(%location, %message, "Nuvio crashed");
+        let text: Vec<u16> = format!("Nuvio hit an error and has to close.\n\nDetails are in:\n{}\n", logging::log_dir().join("nuvio.log").display()).encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "Nuvio".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: both strings are NUL terminated and outlive the call.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR);
+        }
+    }));
 }
 
 fn window_icon() -> Option<egui::IconData> {

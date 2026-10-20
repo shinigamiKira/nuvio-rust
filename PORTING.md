@@ -1,0 +1,38 @@
+# What is ported, and what is not
+
+The reference is the desktop build of Nuvio (`NuvioMedia/NuvioMobile`, branch `cmp-rewrite`, 0.6.2, with the Windows
+target from the Kotlin port). Mobile-only features (gestures, picture in picture, haptics, foreground services) are left
+out on purpose. This table says what the Rust build does today. "Partly" always has the missing part written next to it.
+
+| Area | State | Notes |
+| --- | --- | --- |
+| Addons | done | Install by link (`stremio://` and bare addresses are fixed up), enable, disable, reorder, remove, import from an installed Nuvio for Windows (Kotlin) profile. Cinemeta is installed on the first run. |
+| Home | done | Rotating hero with wordmark, Continue Watching, one shelf per browsable catalog with paging arrows and endless loading. Shelves of the last session are shown from the disk cache before the network answers. |
+| Search | done | Every addon catalog that supports `search`, results arrive row by row. |
+| Library | done | Local only. |
+| Details | partly | Facts, description, genres, seasons and episodes with watch progress, cast, credits, trailer (opens YouTube in the browser). No TMDB enrichment (it needs a key), no ratings from MDBList, no comments, no collections. |
+| Streams | done | All addons at once, filters for resolution, addon, service (RD, TB, ...), HDR and language, card layout like the Kotlin build, the server is warmed while the pointer rests on a card. |
+| Player | done | libmpv drawing into the window through OpenGL. Controls show on pointer movement and hide with the cursor; tooltips, volume slider and on-screen volume and seek feedback, audio and subtitle tracks, subtitles from addons, speed, picture size, playback info, previous and next episode, autoplay of the next episode (the stream with the same binge group, else the same addon and resolution), resume position, reopening a stream that was cut off, Dolby Vision profile 5. |
+| Torrents | done | librqbit: magnet or info hash from the stream, the file the addon names (else the episode matching `S01E02`, else the biggest video), served to mpv from a password protected loopback port. |
+| Debrid direct streams | not yet | A stream that only carries `clientResolve` (no `url`, no `infoHash`) cannot be played. Addons that resolve debrid links themselves (AIOStreams, Torrentio with a debrid key) return a plain `url` and work. |
+| Plugins (QuickJS scrapers) | not yet | |
+| Accounts and sync | not yet | The upstream backend keys are not part of the sources, as in the Kotlin port. The app is the "Continue without account" experience: everything is local. |
+| Profiles | not yet | One profile. |
+| Trakt, Simkl, MDBList, TMDB | not yet | |
+| Downloads | not yet | |
+| Notifications, tray | not yet | |
+| External players | not yet | |
+| Skip intro, subtitle styling | not yet | |
+| Themes | partly | The twelve palettes and a pure black switch; no custom palette editor. |
+| Auto update | not applicable | There is no update feed. |
+| Deep links (`nuvio://`) | not applicable | The installer does not claim the scheme, so it does not fight the Kotlin build for it. |
+
+## Where behaviour differs on purpose
+
+* **Data folder.** `%APPDATA%\NuvioRust` and `%LOCALAPPDATA%\NuvioRust`, so the Kotlin and Rust builds can be installed
+  together without sharing state. Addons can be imported from the Kotlin profile with one click.
+* **Dolby Vision profile 5.** Same method as the Kotlin build (libplacebo filter, NVDEC copy-back decoder), because the
+  OpenGL render API of libmpv only offers the classic renderer, which does not reshape profile 5. The result is checked,
+  and the file is reopened without the filter when mpv dropped it.
+* **Images.** Posters are decoded off the UI thread and shrunk to the size they are drawn at with a Lanczos filter; they
+  are cached on disk (400 MB cap).

@@ -321,6 +321,17 @@ fn appearance(cx: &mut Cx, ui: &mut Ui) {
         }
     });
     ui.add_space(14.0);
+    ui.add_space(4.0);
+    note(ui, "Poster shape on Home");
+    ui.horizontal(|ui| {
+        for (value, label) in [("auto", "Automatic"), ("portrait", "Portrait"), ("landscape", "Landscape")] {
+            if ui_kit::chip(ui, label, cx.state.settings.poster_style == value).clicked() {
+                cx.state.settings.poster_style = value.to_owned();
+                changed = true;
+            }
+        }
+    });
+    ui.add_space(8.0);
     changed |= switch_row(ui, "Pure black background", Some("Use true black instead of the theme's dark grey."), &mut cx.state.settings.amoled);
     changed |= switch_row(ui, "Featured banner on Home", Some("Show the large rotating banner above the shelves."), &mut cx.state.settings.hero);
     let mut show_type = cx.state.settings.show_catalog_type;

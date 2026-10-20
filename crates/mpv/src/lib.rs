@@ -190,10 +190,15 @@ impl Mpv {
         check(&self.api, code)
     }
 
+    /// Sets a property without waiting for the player core to apply it.
     pub fn set_str(&self, name: &str, value: &str) -> Result<()> {
         let (n, v) = (cstring(name), cstring(value));
-        // SAFETY: valid strings; mpv copies them.
-        check(&self.api, unsafe { (self.api.mpv_set_property_string)(self.handle, n.as_ptr(), v.as_ptr()) })
+        let mut data: *const c_char = v.as_ptr();
+        // SAFETY: for MPV_FORMAT_STRING the data is a pointer to the string pointer; mpv copies it before returning.
+        let code = unsafe {
+            (self.api.mpv_set_property_async)(self.handle, 0, n.as_ptr(), sys::FORMAT_STRING, &mut data as *mut *const c_char as *mut c_void)
+        };
+        check(&self.api, code)
     }
 
     pub fn set_f64(&self, name: &str, mut value: f64) -> Result<()> {
@@ -216,6 +221,10 @@ impl Mpv {
     }
 
     /// Reads a property as text. Structured properties (`track-list`, `video-params`) come back as JSON.
+    ///
+    /// The getters wait for the player core to answer, and the core can be waiting for the video output, which only
+    /// starts when the thread that renders calls `RenderContext::render`. Never call them on that thread; observe the
+    /// property and read the events instead.
     pub fn get_str(&self, name: &str) -> Option<String> {
         let n = cstring(name);
         // SAFETY: the returned string is owned by us and released with mpv_free.

@@ -19,6 +19,9 @@ const DV_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 /// mpv's HTTP stream retries an interrupted transfer a few times and then reports end of file. When that happens far
 /// from the end, the stream is opened again where it stopped, this many times before giving up.
 const MAX_RECOVERIES: u32 = 5;
+/// In the order to try them. NVDEC hands its frames to OpenGL without a copy (35 % of a core on a 30 fps 2160p HEVC
+/// file, against 90 % for the copy-back decoders); the copy-back ones are for GPUs that cannot do that through OpenGL.
+const HARDWARE_DECODERS: &str = "nvdec,d3d11va-copy,dxva2-copy";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
@@ -134,6 +137,8 @@ pub struct State {
     pub hwdec: String,
     pub video_size: Option<(i64, i64)>,
     pub seeking: bool,
+    /// The colour matrix of the picture after the filters (`video-out-params/colormatrix`).
+    out_matrix: Option<String>,
 }
 
 /// What a player needs to know to open a stream.
@@ -220,6 +225,9 @@ enum DolbyVision {
 pub struct Player {
     mpv: Arc<Mpv>,
     hardware_decoding: bool,
+    stats_shared: Arc<Mutex<Vec<(&'static str, String)>>>,
+    stats_busy: Arc<AtomicBool>,
+    stats_at: Instant,
     source: Option<Source>,
     /// The per-file options of the current load, kept so a recovery reopens the file the same way.
     last_extra: Vec<String>,
@@ -237,7 +245,7 @@ pub struct Player {
 impl Player {
     pub fn new(ctx: &egui::Context, hardware_decoding: bool) -> nuvio_mpv::Result<Self> {
         let repaint = ctx.clone();
-        let hwdec = std::env::var("NUVIO_MPV_HWDEC").unwrap_or_else(|_| if hardware_decoding { "auto-copy-safe".into() } else { "no".into() });
+        let hwdec = std::env::var("NUVIO_MPV_HWDEC").unwrap_or_else(|_| if hardware_decoding { HARDWARE_DECODERS.into() } else { "no".into() });
         let vo = std::env::var("NUVIO_MPV_VO").unwrap_or_else(|_| "libmpv".into());
         let start_buffer = START_BUFFER_SECS.to_string();
         let mut options: Vec<(String, String)> = vec![
@@ -292,6 +300,9 @@ impl Player {
             ("eof-reached", Observe::Flag),
             ("hwdec-current", Observe::Text),
             ("track-list", Observe::Text),
+            ("video-params/w", Observe::Int),
+            ("video-params/h", Observe::Int),
+            ("video-out-params/colormatrix", Observe::Text),
         ] {
             mpv.observe(name, kind);
         }
@@ -305,6 +316,9 @@ impl Player {
         Ok(Self {
             mpv,
             hardware_decoding,
+            stats_shared: Arc::new(Mutex::new(Vec::new())),
+            stats_busy: Arc::new(AtomicBool::new(false)),
+            stats_at: Instant::now() - Duration::from_secs(5),
             source: None,
             last_extra: Vec::new(),
             recoveries: 0,
@@ -367,10 +381,10 @@ impl Player {
         }
     }
 
-    /// After a file loads: is it Dolby Vision profile 5, and if it was reopened with the filter, did that start?
-    fn check_dolby_vision(&mut self) {
+    /// Once the tracks of a freshly loaded file are known: is it Dolby Vision profile 5?
+    fn detect_dolby_vision(&mut self) {
         match self.dolby_vision {
-            DolbyVision::Unchecked => {
+            DolbyVision::Unchecked if !self.state.tracks.is_empty() => {
                 let found = self.state.tracks.iter().find(|t| t.kind == "video" && t.dolby_vision_profile == Some(5)).cloned();
                 let Some(track) = found else {
                     self.dolby_vision = DolbyVision::NotNeeded;
@@ -397,14 +411,13 @@ impl Player {
                 let at = self.state.position.max(source.start);
                 self.load(&source, &extra, at);
             }
-            DolbyVision::Opening => self.dolby_vision = DolbyVision::Verifying(Instant::now()),
             _ => {}
         }
     }
 
     fn verify_dolby_vision(&mut self) {
         let DolbyVision::Verifying(since) = self.dolby_vision else { return };
-        match self.mpv.get_str("video-out-params/colormatrix") {
+        match self.state.out_matrix.clone() {
             Some(matrix) if matrix == "dolbyvision" => {
                 tracing::warn!("the Dolby Vision filter did not start, playing without it");
                 self.dolby_vision = DolbyVision::Dropped;
@@ -490,8 +503,31 @@ impl Player {
         let _ = self.mpv.command(&["stop"]);
     }
 
-    pub fn property(&self, name: &str) -> Option<String> {
-        self.mpv.get_str(name)
+    /// Playback details for the info panel. They are read on a short-lived thread, a few times a second: the getters of
+    /// libmpv wait for the player core and must stay off the thread that renders.
+    pub fn stats(&mut self) -> Vec<(&'static str, String)> {
+        if self.stats_at.elapsed() > Duration::from_millis(500) && !self.stats_busy.swap(true, Ordering::AcqRel) {
+            self.stats_at = Instant::now();
+            let (mpv, shared, busy, ctx) = (self.mpv.clone(), self.stats_shared.clone(), self.stats_busy.clone(), self.surface.ctx.clone());
+            std::thread::spawn(move || {
+                let get = |name: &str| mpv.get_str(name).unwrap_or_else(|| "–".into());
+                let speed = mpv.get_f64("cache-speed").unwrap_or(0.0) / 1_048_576.0;
+                let lines = vec![
+                    ("Video", format!("{} {}×{} @ {} fps", get("video-codec"), get("video-params/w"), get("video-params/h"), get("container-fps"))),
+                    ("Decoder", get("hwdec-current")),
+                    ("Colour", format!("{} / {}", get("video-params/colormatrix"), get("video-params/gamma"))),
+                    ("Audio", format!("{} {}", get("audio-codec-name"), get("audio-params/hr-channels"))),
+                    ("Network", format!("{speed:.1} MB/s")),
+                    ("Frames", format!("{} dropped, {} delayed", get("frame-drop-count"), get("vo-delayed-frame-count"))),
+                ];
+                if let Ok(mut slot) = shared.lock() {
+                    *slot = lines;
+                }
+                busy.store(false, Ordering::Release);
+                ctx.request_repaint();
+            });
+        }
+        self.stats_shared.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Reads what changed in mpv since the last call. Call once per frame.
@@ -506,12 +542,11 @@ impl Player {
             match event {
                 Event::FileLoaded => {
                     self.state.loaded = true;
-                    self.refresh_tracks();
-                    if let Some(w) = self.mpv.get_i64("video-params/w") {
-                        let h = self.mpv.get_i64("video-params/h").unwrap_or(0);
-                        self.state.video_size = Some((w, h));
+                    if self.dolby_vision == DolbyVision::Opening {
+                        self.dolby_vision = DolbyVision::Verifying(Instant::now());
+                    } else {
+                        self.detect_dolby_vision();
                     }
-                    self.check_dolby_vision();
                 }
                 Event::PlaybackRestart => {
                     if !self.state.started {
@@ -578,21 +613,19 @@ impl Player {
             ("eof-reached", Value::Flag(true)) if self.should_recover() => self.recover(),
             ("eof-reached", Value::Flag(reached)) => self.state.ended = *reached,
             ("hwdec-current", Value::Text(v)) => self.state.hwdec = v.clone(),
-            ("track-list", Value::Text(json)) => {
-                if let Ok(tracks) = serde_json::from_str::<Vec<Track>>(json) {
+            ("track-list", Value::Text(json)) => match serde_json::from_str::<Vec<Track>>(json) {
+                Ok(tracks) => {
                     self.state.tracks = tracks;
+                    if self.state.loaded {
+                        self.detect_dolby_vision();
+                    }
                 }
-            }
-            _ => {}
-        }
-    }
-
-    fn refresh_tracks(&mut self) {
-        if let Some(json) = self.mpv.get_str("track-list") {
-            match serde_json::from_str::<Vec<Track>>(&json) {
-                Ok(tracks) => self.state.tracks = tracks,
                 Err(error) => tracing::warn!(%error, "could not read the track list"),
-            }
+            },
+            ("video-params/w", Value::Int(w)) => self.state.video_size = Some((*w, self.state.video_size.map(|s| s.1).unwrap_or(0))),
+            ("video-params/h", Value::Int(h)) => self.state.video_size = Some((self.state.video_size.map(|s| s.0).unwrap_or(0), *h)),
+            ("video-out-params/colormatrix", Value::Text(matrix)) => self.state.out_matrix = Some(matrix.clone()),
+            _ => {}
         }
     }
 

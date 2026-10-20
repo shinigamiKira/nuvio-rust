@@ -45,6 +45,9 @@ pub struct App {
     keys_fired: Vec<usize>,
     logged_first_frame: bool,
     logged_first_content: bool,
+    perf: bool,
+    frames: u32,
+    frames_since: Instant,
 }
 
 /// After "next episode": play the stream that matches the one just watched as soon as the addon lists it.
@@ -90,6 +93,9 @@ impl App {
             keys_fired: Vec::new(),
             logged_first_frame: false,
             logged_first_content: false,
+            perf: std::env::var_os("NUVIO_PERF").is_some(),
+            frames: 0,
+            frames_since: Instant::now(),
         };
         app.state.start_addons(&app.svc);
         if let Some(url) = app.args.play.clone() {
@@ -101,6 +107,15 @@ impl App {
 
     /// Timing lines for the startup budget: first frame, and first poster shelf with content.
     fn log_milestones(&mut self) {
+        // `NUVIO_PERF=1` logs how many frames were drawn each second, to find a screen that keeps repainting.
+        if self.perf {
+            self.frames += 1;
+            if self.frames_since.elapsed() >= Duration::from_secs(1) {
+                tracing::info!(frames = self.frames, "frames in the last second");
+                self.frames = 0;
+                self.frames_since = Instant::now();
+            }
+        }
         let since_start = || crate::START.get().map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
         if !self.logged_first_frame {
             self.logged_first_frame = true;
