@@ -1,0 +1,27 @@
+[package]
+name = "nuvio"
+description = "Nuvio for Windows, written in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "system_fonts"] }
+# Colour glyphs, so the emoji addons put in stream descriptions (folders, discs, flags) draw as the system font has them.
+epaint = { version = "0.37.0", default-features = false, features = ["color_fonts"] }
+fast_image_resize = "6.1.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+nuvio-core = { version = "0.1.0", path = "../core" }
+nuvio-mpv = { version = "0.1.0", path = "../mpv" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm", "Win32_System_Console"] }
+
+[build-dependencies]
+embed-resource = "3.0.12"
