@@ -28,6 +28,14 @@ pub enum Msg {
     Torrent { request: u64, result: Result<String, String> },
 }
 
+/// Asks for a frame because something finished off the UI thread (a download, a message from mpv).
+///
+/// `request_repaint()` makes egui draw two frames, which for a 4K video pass doubled the work; asking for "in half a
+/// millisecond" draws one.
+pub fn wake(ctx: &egui::Context) {
+    ctx.request_repaint_after(std::time::Duration::from_micros(500));
+}
+
 #[derive(Clone)]
 pub struct Services {
     pub runtime: Handle,
@@ -64,13 +72,13 @@ impl Services {
             let message = work.await;
             // The receiver is gone when the app is closing; there is nobody left to tell.
             let _ = tx.send(message);
-            ctx.request_repaint();
+            wake(&ctx);
         });
     }
 
     /// Delivers a message produced on the UI thread through the same path as background results.
     pub fn post(&self, message: Msg) {
         let _ = self.tx.send(message);
-        self.ctx.request_repaint();
+        wake(&self.ctx);
     }
 }

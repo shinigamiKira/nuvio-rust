@@ -47,6 +47,7 @@ pub struct App {
     logged_first_content: bool,
     perf: bool,
     frames: u32,
+    frame_nr_before: u64,
     frames_since: Instant,
 }
 
@@ -95,6 +96,7 @@ impl App {
             logged_first_content: false,
             perf: std::env::var_os("NUVIO_PERF").is_some(),
             frames: 0,
+            frame_nr_before: 0,
             frames_since: Instant::now(),
         };
         app.state.start_addons(&app.svc);
@@ -106,12 +108,14 @@ impl App {
     }
 
     /// Timing lines for the startup budget: first frame, and first poster shelf with content.
-    fn log_milestones(&mut self) {
+    fn log_milestones(&mut self, ctx: &egui::Context) {
         // `NUVIO_PERF=1` logs how many frames were drawn each second, to find a screen that keeps repainting.
         if self.perf {
             self.frames += 1;
             if self.frames_since.elapsed() >= Duration::from_secs(1) {
-                tracing::info!(frames = self.frames, "frames in the last second");
+                let painted = ctx.cumulative_frame_nr() - self.frame_nr_before;
+                self.frame_nr_before = ctx.cumulative_frame_nr();
+                tracing::info!(passes = self.frames, painted, "frames in the last second");
                 self.frames = 0;
                 self.frames_since = Instant::now();
             }
@@ -686,7 +690,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.log_milestones();
+        self.log_milestones(&ctx);
         self.drain_messages();
         self.svc.images.begin_frame();
         if !self.opened_from_args {

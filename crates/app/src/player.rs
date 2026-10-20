@@ -1,6 +1,6 @@
 //! The player: one libmpv instance drawing into the window through OpenGL, plus the state the controls show.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -150,9 +150,58 @@ pub struct Source {
     pub subtitles: Vec<String>,
 }
 
+/// Timing shared with mpv's threads: when it last announced a video frame, when that last repainted the window, and how
+/// long a frame of the current file lasts.
+#[derive(Clone)]
+struct Clock {
+    epoch: Instant,
+    last_video_frame: Arc<AtomicU64>,
+    last_video_repaint: Arc<AtomicU64>,
+    frame_ms: Arc<AtomicU64>,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self { epoch: Instant::now(), last_video_frame: Arc::default(), last_video_repaint: Arc::default(), frame_ms: Arc::default() }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64 + 1
+    }
+
+    fn mark_video_frame(&self) {
+        self.last_video_frame.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// With the frame rate known, mpv's second announcement of a frame (it calls back about twice per frame) does not
+    /// need another pass over a 4K picture.
+    fn should_repaint_for_video(&self) -> bool {
+        let (now, frame) = (self.now_ms(), self.frame_ms.load(Ordering::Relaxed));
+        if frame > 0 && now.saturating_sub(self.last_video_repaint.load(Ordering::Relaxed)) < frame * 6 / 10 {
+            return false;
+        }
+        self.last_video_repaint.store(now, Ordering::Relaxed);
+        true
+    }
+
+    fn set_fps(&self, fps: f64) {
+        let frame = if fps >= 10.0 { (1000.0 / fps) as u64 } else { 0 };
+        self.frame_ms.store(frame, Ordering::Relaxed);
+    }
+
+    fn since_video_frame(&self) -> Duration {
+        let last = self.last_video_frame.load(Ordering::Relaxed);
+        if last == 0 {
+            return Duration::MAX;
+        }
+        self.epoch.elapsed().saturating_sub(Duration::from_millis(last - 1))
+    }
+}
+
 /// The GL half of the player, shared with the paint callback that runs inside egui's render pass.
 struct Surface {
     mpv: Arc<Mpv>,
+    clock: Clock,
     ctx: egui::Context,
     render: Mutex<Option<GlSide>>,
     failed: Mutex<Option<String>>,
@@ -174,12 +223,17 @@ impl Surface {
             if self.failed.lock().map(|f| f.is_some()).unwrap_or(false) {
                 return;
             }
-            let ctx = self.ctx.clone();
-            match RenderContext::new_opengl(&self.mpv, move || ctx.request_repaint()) {
+            let (ctx, clock) = (self.ctx.clone(), self.clock.clone());
+            match RenderContext::new_opengl(&self.mpv, move || {
+                clock.mark_video_frame();
+                if clock.should_repaint_for_video() {
+                    crate::services::wake(&ctx);
+                }
+            }) {
                 Ok(context) => {
                     *slot = Some(GlSide(context));
                     self.ready.store(true, Ordering::Release);
-                    self.ctx.request_repaint();
+                    crate::services::wake(&self.ctx);
                 }
                 Err(error) => {
                     tracing::error!(%error, "could not create the mpv render context");
@@ -283,7 +337,16 @@ impl Player {
             }
         }
         let borrowed: Vec<(&str, &str)> = options.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-        let mpv = Arc::new(Mpv::new(&borrowed, move || repaint.request_repaint())?);
+        // mpv wakes this up for every property change, dozens of times a second. Each wake is a whole frame of the window
+        // (and another full-size video pass). While video frames are arriving they repaint the window themselves, so a wake
+        // that comes right after one is dropped; otherwise (paused, buffering) wakes are coalesced to 30 a second.
+        let clock = Clock::new();
+        let wake_clock = clock.clone();
+        let mpv = Arc::new(Mpv::new(&borrowed, move || {
+            if wake_clock.since_video_frame() > Duration::from_millis(50) {
+                repaint.request_repaint_after(Duration::from_millis(33));
+            }
+        })?);
         mpv.request_log_level(&std::env::var("NUVIO_MPV_LOG").unwrap_or_else(|_| "warn".into()));
         for (name, kind) in [
             ("time-pos", Observe::Double),
@@ -296,6 +359,7 @@ impl Player {
             ("mute", Observe::Flag),
             ("speed", Observe::Double),
             ("seeking", Observe::Flag),
+            ("container-fps", Observe::Double),
             // With keep-open mpv never sends END_FILE at the end; it parks on the last frame and raises this flag.
             ("eof-reached", Observe::Flag),
             ("hwdec-current", Observe::Text),
@@ -308,6 +372,7 @@ impl Player {
         }
         let surface = Arc::new(Surface {
             mpv: mpv.clone(),
+            clock,
             ctx: ctx.clone(),
             render: Mutex::new(None),
             failed: Mutex::new(None),
@@ -341,7 +406,7 @@ impl Player {
     }
 
     fn ctx_repaint(&self) {
-        self.surface.ctx.request_repaint();
+        crate::services::wake(&self.surface.ctx);
     }
 
     fn start_pending(&mut self) {
@@ -524,7 +589,7 @@ impl Player {
                     *slot = lines;
                 }
                 busy.store(false, Ordering::Release);
-                ctx.request_repaint();
+                crate::services::wake(&ctx);
             });
         }
         self.stats_shared.lock().map(|s| s.clone()).unwrap_or_default()
@@ -610,6 +675,7 @@ impl Player {
             ("mute", Value::Flag(v)) => self.state.muted = *v,
             ("speed", v) => self.state.speed = v.as_f64().unwrap_or(1.0),
             ("seeking", Value::Flag(v)) => self.state.seeking = *v,
+            ("container-fps", Value::Double(fps)) => self.surface.clock.set_fps(*fps),
             ("eof-reached", Value::Flag(true)) if self.should_recover() => self.recover(),
             ("eof-reached", Value::Flag(reached)) => self.state.ended = *reached,
             ("hwdec-current", Value::Text(v)) => self.state.hwdec = v.clone(),

@@ -141,7 +141,7 @@ impl Images {
             if let Ok(mut entries) = inner.entries.lock() {
                 entries.insert(key, entry);
             }
-            inner.ctx.request_repaint();
+            crate::services::wake(&inner.ctx);
         });
     }
 }
