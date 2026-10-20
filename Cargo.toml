@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/mpv", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/NuvioMedia/NuvioMobile"
+rust-version = "1.90"
+
+[profile.dev]
+opt-level = 1
+
+# egui and the image decoders are unusably slow in a debug build, and they are not the code being debugged.
+[profile.dev.package."*"]
+opt-level = 3
+
+# What the installer ships.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Release code without the link time cost, for edit-build-run loops.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+strip = false

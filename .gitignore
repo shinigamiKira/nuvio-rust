@@ -1,0 +1,6 @@
+/target
+/dist
+*.log
+*.png.tmp
+# libmpv is fetched by scripts/fetch-libmpv.ps1, not committed
+/libs/
