@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, PaintCallback, Rect};
 use eframe::egui_glow;
@@ -12,6 +12,10 @@ use serde::Deserialize;
 /// Seconds of media buffered before a stalled stream resumes. A first start needs less, a stall deserves more.
 const START_BUFFER_SECS: u32 = 1;
 const REBUFFER_SECS: u32 = 5;
+/// The Dolby Vision filter runs on 1920 px wide frames: at 4K it fell to 12 frames a second, at 1920 it keeps up.
+const DV_FILTER_WIDTH: i64 = 1920;
+/// How long to wait for mpv to report what the filter chain produced.
+const DV_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
@@ -34,6 +38,8 @@ pub struct Track {
     pub height: Option<i64>,
     #[serde(default, rename = "demux-channel-count")]
     pub channels: Option<i64>,
+    #[serde(default, rename = "dolby-vision-profile")]
+    pub dolby_vision_profile: Option<i64>,
 }
 
 impl Track {
@@ -128,6 +134,7 @@ pub struct State {
 }
 
 /// What a player needs to know to open a stream.
+#[derive(Clone)]
 pub struct Source {
     pub url: String,
     pub start: f64,
@@ -191,8 +198,27 @@ impl Surface {
     }
 }
 
+/// Dolby Vision profile 5 has no HDR10 layer to fall back on: its colours only come out right after libplacebo reshapes
+/// them, which mpv's own renderer does not do. Such a file is opened a second time with a libplacebo filter that
+/// converts it to SDR. mpv silently drops a filter it cannot start, so the result is checked.
+#[derive(Clone, Copy, PartialEq)]
+enum DolbyVision {
+    Unchecked,
+    NotNeeded,
+    /// Reopened with the filter, waiting for the second `FileLoaded`.
+    Opening,
+    /// Playing with the filter; waiting to see what colour matrix comes out of it.
+    Verifying(Instant),
+    Converting,
+    /// The filter did not start; the file was opened again without it.
+    Dropped,
+}
+
 pub struct Player {
     mpv: Arc<Mpv>,
+    hardware_decoding: bool,
+    source: Option<Source>,
+    dolby_vision: DolbyVision,
     surface: Arc<Surface>,
     pub state: State,
     scratch: Vec<Event>,
@@ -205,7 +231,7 @@ pub struct Player {
 impl Player {
     pub fn new(ctx: &egui::Context, hardware_decoding: bool) -> nuvio_mpv::Result<Self> {
         let repaint = ctx.clone();
-        let hwdec = std::env::var("NUVIO_MPV_HWDEC").unwrap_or_else(|_| if hardware_decoding { "auto-safe".into() } else { "no".into() });
+        let hwdec = std::env::var("NUVIO_MPV_HWDEC").unwrap_or_else(|_| if hardware_decoding { "auto-copy-safe".into() } else { "no".into() });
         let vo = std::env::var("NUVIO_MPV_VO").unwrap_or_else(|_| "libmpv".into());
         let start_buffer = START_BUFFER_SECS.to_string();
         let mut options: Vec<(String, String)> = vec![
@@ -269,6 +295,9 @@ impl Player {
         });
         Ok(Self {
             mpv,
+            hardware_decoding,
+            source: None,
+            dolby_vision: DolbyVision::Unchecked,
             surface,
             state: State { volume: 100.0, speed: 1.0, ..State::default() },
             scratch: Vec::new(),
@@ -292,20 +321,25 @@ impl Player {
 
     fn start_pending(&mut self) {
         let Some(source) = self.pending.take() else { return };
+        self.dolby_vision = DolbyVision::Unchecked;
+        self.opened = Instant::now();
+        let start = source.start;
+        self.load(&source, &[], start);
+        self.source = Some(source);
+    }
+
+    /// Sends the file to mpv. `extra` are per-file options (a filter, a decoder) that only apply to this load.
+    fn load(&mut self, source: &Source, extra: &[String], start: f64) {
         self.state = State { volume: self.state.volume, muted: self.state.muted, speed: 1.0, ..State::default() };
         self.rebuffer_raised = false;
-        self.opened = Instant::now();
         let _ = self.mpv.set_str("cache-pause-wait", &START_BUFFER_SECS.to_string());
-        let headers = source
-            .headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}"))
-            .collect::<Vec<_>>();
+        let headers: Vec<String> = source.headers.iter().map(|(name, value)| format!("{name}: {value}")).collect();
         let _ = self.mpv.set_str("http-header-fields", &headers.join(","));
-        let mut options = Vec::new();
-        if source.start > 1.0 {
-            options.push(format!("start={:.3}", source.start));
+        let mut options: Vec<String> = Vec::new();
+        if start > 1.0 {
+            options.push(format!("start={start:.3}"));
         }
+        options.extend(extra.iter().cloned());
         let options = options.join(",");
         let result = if options.is_empty() {
             self.mpv.command(&["loadfile", &source.url, "replace"])
@@ -317,6 +351,61 @@ impl Player {
         }
         for subtitle in &source.subtitles {
             let _ = self.mpv.command(&["sub-add", subtitle, "auto"]);
+        }
+    }
+
+    /// After a file loads: is it Dolby Vision profile 5, and if it was reopened with the filter, did that start?
+    fn check_dolby_vision(&mut self) {
+        match self.dolby_vision {
+            DolbyVision::Unchecked => {
+                let found = self.state.tracks.iter().find(|t| t.kind == "video" && t.dolby_vision_profile == Some(5)).cloned();
+                let Some(track) = found else {
+                    self.dolby_vision = DolbyVision::NotNeeded;
+                    return;
+                };
+                let Some(source) = self.source.clone() else { return };
+                let (width, height) = (track.width.unwrap_or(0), track.height.unwrap_or(0));
+                let scale = if width > DV_FILTER_WIDTH && height > 0 {
+                    format!("w={DV_FILTER_WIDTH}:h={}:", (height * DV_FILTER_WIDTH / width) & !1)
+                } else {
+                    String::new()
+                };
+                let mut extra = vec![format!(
+                    "vf=libplacebo={scale}tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p"
+                )];
+                // A filter only takes frames in memory. Given the zero-copy frames of a GPU decoder mpv drops it and plays
+                // the picture green and purple, so the decode is copied back: NVDEC keeps up at 4K, other GPUs fall back
+                // to software decoding.
+                if self.hardware_decoding {
+                    extra.push("hwdec=nvdec-copy".into());
+                }
+                tracing::info!("Dolby Vision profile 5: opening again with libplacebo");
+                self.dolby_vision = DolbyVision::Opening;
+                let at = self.state.position.max(source.start);
+                self.load(&source, &extra, at);
+            }
+            DolbyVision::Opening => self.dolby_vision = DolbyVision::Verifying(Instant::now()),
+            _ => {}
+        }
+    }
+
+    fn verify_dolby_vision(&mut self) {
+        let DolbyVision::Verifying(since) = self.dolby_vision else { return };
+        match self.mpv.get_str("video-out-params/colormatrix") {
+            Some(matrix) if matrix == "dolbyvision" => {
+                tracing::warn!("the Dolby Vision filter did not start, playing without it");
+                self.dolby_vision = DolbyVision::Dropped;
+                if let Some(source) = self.source.clone() {
+                    let at = self.state.position;
+                    self.load(&source, &[], at);
+                }
+            }
+            Some(matrix) if !matrix.is_empty() => {
+                tracing::info!(matrix, "Dolby Vision filter is converting");
+                self.dolby_vision = DolbyVision::Converting;
+            }
+            _ if since.elapsed() > DV_VERIFY_TIMEOUT => self.dolby_vision = DolbyVision::Converting,
+            _ => self.surface.ctx.request_repaint_after(Duration::from_millis(200)),
         }
     }
 
@@ -399,6 +488,7 @@ impl Player {
                         let h = self.mpv.get_i64("video-params/h").unwrap_or(0);
                         self.state.video_size = Some((w, h));
                     }
+                    self.check_dolby_vision();
                 }
                 Event::PlaybackRestart => {
                     if !self.state.started {
@@ -429,6 +519,7 @@ impl Player {
             }
         }
         self.scratch = events;
+        self.verify_dolby_vision();
     }
 
     fn apply_property(&mut self, name: &str, value: &Value) {
