@@ -556,7 +556,13 @@ impl App {
         let mut parts = target.splitn(3, ':');
         match (parts.next(), parts.next(), parts.next()) {
             (Some("home"), ..) => {}
-            (Some("search"), ..) => self.routes = vec![Route::Tab(Tab::Search)],
+            (Some("search"), query, _) => {
+                self.routes = vec![Route::Tab(Tab::Search)];
+                if let Some(query) = query {
+                    self.state.search.query = query.to_owned();
+                    self.state.run_search(&self.svc);
+                }
+            }
             (Some("library"), ..) => self.routes = vec![Route::Tab(Tab::Library)],
             (Some("settings"), page, _) => {
                 self.routes = vec![Route::Tab(Tab::Settings)];

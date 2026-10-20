@@ -105,7 +105,9 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
         view.hero_index = 0;
         view.hero_prev = 0;
     }
-    if view.hero_since.elapsed() > HERO_INTERVAL && !response.hovered() {
+    // The banner stands still while the pointer is on it and while the window is in the background.
+    let attended = ui.ctx().input(|i| i.focused);
+    if view.hero_since.elapsed() > HERO_INTERVAL && !response.hovered() && attended {
         view.hero_prev = view.hero_index;
         view.hero_index = (view.hero_index + 1) % items.len();
         view.hero_since = std::time::Instant::now();
