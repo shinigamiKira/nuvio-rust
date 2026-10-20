@@ -227,7 +227,8 @@ impl Surface {
             match RenderContext::new_opengl(&self.mpv, move || {
                 clock.mark_video_frame();
                 if clock.should_repaint_for_video() {
-                    crate::services::wake(&ctx);
+                    // A new picture: as soon as possible, but through the delayed path (an immediate request draws two frames).
+                    ctx.request_repaint_after(Duration::from_micros(500));
                 }
             }) {
                 Ok(context) => {

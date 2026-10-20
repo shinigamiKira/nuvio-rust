@@ -48,6 +48,7 @@ pub struct App {
     perf: bool,
     frames: u32,
     frame_nr_before: u64,
+    causes: std::collections::HashMap<String, u32>,
     frames_since: Instant,
 }
 
@@ -97,6 +98,7 @@ impl App {
             perf: std::env::var_os("NUVIO_PERF").is_some(),
             frames: 0,
             frame_nr_before: 0,
+            causes: Default::default(),
             frames_since: Instant::now(),
         };
         app.state.start_addons(&app.svc);
@@ -112,10 +114,19 @@ impl App {
         // `NUVIO_PERF=1` logs how many frames were drawn each second, to find a screen that keeps repainting.
         if self.perf {
             self.frames += 1;
+            for cause in ctx.repaint_causes() {
+                *self.causes.entry(cause.to_string()).or_insert(0u32) += 1;
+            }
             if self.frames_since.elapsed() >= Duration::from_secs(1) {
                 let painted = ctx.cumulative_frame_nr() - self.frame_nr_before;
                 self.frame_nr_before = ctx.cumulative_frame_nr();
                 tracing::info!(passes = self.frames, painted, "frames in the last second");
+                // What asked for them: the call sites that requested a repaint, most frequent first.
+                let mut causes: Vec<_> = self.causes.drain().collect();
+                causes.sort_by_key(|c| std::cmp::Reverse(c.1));
+                for (cause, count) in causes.into_iter().take(3) {
+                    tracing::info!(count, %cause, "repaint requested by");
+                }
                 self.frames = 0;
                 self.frames_since = Instant::now();
             }
@@ -224,6 +235,29 @@ impl App {
                 }
                 Action::OpenExternal(url) => open_in_browser(&url),
             }
+        }
+    }
+
+    /// Keys that work on every screen except while a text field has the keyboard (and the player, which has its own).
+    fn global_shortcuts(&mut self, ctx: &egui::Context, route: &Route) {
+        if matches!(route, Route::Player) || ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let (f11, search, back) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::F11),
+                (i.modifiers.command && i.key_pressed(egui::Key::K)) || i.key_pressed(egui::Key::Slash),
+                i.key_pressed(egui::Key::Backspace) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
+            )
+        });
+        if f11 {
+            self.actions.push(Action::Fullscreen(!self.view.fullscreen));
+        }
+        if search && !matches!(route, Route::Tab(Tab::Search)) {
+            self.actions.push(Action::Tab(Tab::Search));
+        }
+        if back && !matches!(route, Route::Tab(_)) {
+            self.actions.push(Action::Back);
         }
     }
 
@@ -683,7 +717,7 @@ impl App {
             glass_panel(ui, rect, rect.height() / 2.0, alpha);
             ui.painter().galley(rect.min + vec2(22.0, 13.0), galley, ui_kit::with_alpha(t.text, alpha));
         });
-        ctx.request_repaint();
+        crate::services::animate_on(ctx);
     }
 }
 
@@ -730,6 +764,7 @@ impl eframe::App for App {
             self.state.refresh_home(&self.svc);
             self.push_toast("Refreshing Home…");
         }
+        self.global_shortcuts(&ctx, &route);
         self.run_auto_pick(&ctx);
         self.save_progress(false);
         self.drive_tests(&ctx);

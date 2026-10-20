@@ -619,7 +619,7 @@ fn hud(session: &mut Session, ui: &mut Ui, rect: Rect) {
         session.hud = None;
         return;
     }
-    ui.ctx().request_repaint();
+    crate::services::animate_on(ui.ctx());
     let fade = 1.0 - ((age.as_secs_f32() - (HUD_SHOW.as_secs_f32() - 0.3)) / 0.3).clamp(0.0, 1.0);
     let enter = (age.as_secs_f32() / 0.12).min(1.0);
     let alpha = fade * enter;

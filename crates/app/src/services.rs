@@ -28,12 +28,18 @@ pub enum Msg {
     Torrent { request: u64, result: Result<String, String> },
 }
 
-/// Asks for a frame because something finished off the UI thread (a download, a message from mpv).
+/// Asks for a frame because something finished off the UI thread (a download, a result, a message from mpv).
 ///
-/// `request_repaint()` makes egui draw two frames, which for a 4K video pass doubled the work; asking for "in half a
-/// millisecond" draws one.
+/// `request_repaint()` makes egui draw two frames per request, and a start-up burst of finished images asks hundreds of
+/// times a second. A short delay draws one frame and lets the requests of that moment share it.
 pub fn wake(ctx: &egui::Context) {
-    ctx.request_repaint_after(std::time::Duration::from_micros(500));
+    ctx.request_repaint_after(std::time::Duration::from_millis(12));
+}
+
+/// Keeps an animation going: asks for the next frame in 16 ms. `request_repaint()` draws two frames per request and
+/// runs as fast as the display refreshes (144 per second on this laptop), several times what a fade needs.
+pub fn animate_on(ctx: &egui::Context) {
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
 }
 
 #[derive(Clone)]

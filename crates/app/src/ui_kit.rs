@@ -158,7 +158,7 @@ pub fn paint_cover_alpha(ui: &Ui, rect: Rect, image: &Image, corner: CornerRadiu
                 ui.painter().rect_filled(rect, corner, t.card);
             }
             if fade < 1.0 {
-                ui.ctx().request_repaint();
+                crate::services::animate_on(ui.ctx());
             }
             egui::Image::new((texture.id(), rect.size()))
                 .corner_radius(corner)
@@ -169,7 +169,8 @@ pub fn paint_cover_alpha(ui: &Ui, rect: Rect, image: &Image, corner: CornerRadiu
         Image::Loading => {
             let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) as f32 * 3.0).sin();
             ui.painter().rect_filled(rect, corner, lerp_color(t.card, t.surface, pulse * 0.6));
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            // A placeholder breathes slowly; there is no need to redraw it at video rates.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
         }
         Image::Failed => {
             ui.painter().rect_filled(rect, corner, t.card);
@@ -333,7 +334,7 @@ pub fn spinner(ui: &Ui, center: Pos2, radius_px: f32, color: Color32) {
         })
         .collect();
     ui.painter().add(Shape::line(points, Stroke::new(3.0, color)));
-    ui.ctx().request_repaint();
+    crate::services::animate_on(ui.ctx());
 }
 
 pub fn page_padding(width: f32) -> f32 {

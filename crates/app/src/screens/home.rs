@@ -113,7 +113,12 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
         view.hero_since = std::time::Instant::now();
     }
     // Wake up when the next slide is due, not before: an idle home screen should cost nothing.
-    ui.ctx().request_repaint_after(HERO_INTERVAL.saturating_sub(view.hero_since.elapsed()) + Duration::from_millis(30));
+    // A slide that is due but held back (pointer on it, window in the background) needs no timer: the input that ends the
+    // hold draws a frame.
+    let remaining = HERO_INTERVAL.saturating_sub(view.hero_since.elapsed());
+    if !remaining.is_zero() {
+        ui.ctx().request_repaint_after(remaining + Duration::from_millis(30));
+    }
     let item = &items[view.hero_index];
 
     let bottom = CornerRadius { nw: 0, ne: 0, sw: 28, se: 28 };
@@ -125,7 +130,7 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
         if let Some(previous) = backdrop(items[view.hero_prev].background.as_deref()) {
             ui_kit::paint_cover_alpha(ui, rect, &previous, bottom, 1.0);
         }
-        ui.ctx().request_repaint();
+        crate::services::animate_on(ui.ctx());
     }
     match backdrop(item.background.as_deref()) {
         Some(current) => ui_kit::paint_cover_alpha(ui, rect, &current, bottom, if crossfading { fade } else { 1.0 }),
@@ -384,7 +389,7 @@ fn shelf(cx: &mut Cx, ui: &mut Ui, index: usize, pad: f32) {
                 ui.ctx().data_mut(|d| d.insert_temp(target_id, target));
                 // Start the animation from where the shelf is now, not from where it last stopped.
                 ui.ctx().animate_value_with_time(scroll_id.with("anim"), offset, 0.0);
-                ui.ctx().request_repaint();
+                crate::services::animate_on(ui.ctx());
             }
             if r.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
