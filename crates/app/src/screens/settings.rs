@@ -96,8 +96,17 @@ fn addons(cx: &mut Cx, ui: &mut Ui) {
     ui.add_space(10.0);
 
     ui.horizontal(|ui| {
-        let field_w = ui.available_width() - 130.0;
+        let field_w = ui.available_width() - 250.0;
         let response = text_field(ui, &mut cx.view.add_addon_text, "https://…/manifest.json", field_w);
+        if ui_kit::pill_button(ui, Some(icons::LINK), "Paste", PillStyle::Soft).clicked() {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => {
+                    cx.view.add_addon_text = text.trim().to_owned();
+                    cx.view.add_addon_error = None;
+                }
+                Err(_) => cx.view.add_addon_error = Some("There is no text on the clipboard.".into()),
+            }
+        }
         let submit = ui_kit::pill_button(ui, None, "Install", PillStyle::Primary).clicked()
             || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
         if submit {
@@ -120,6 +129,8 @@ fn addons(cx: &mut Cx, ui: &mut Ui) {
         if fresh > 0 {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
+                // The pill is taller than the text; start the row at its height so the label centres on it.
+                ui.set_min_height(42.0);
                 ui.label(egui::RichText::new(format!("Found {fresh} addon{} in your Nuvio for Windows profile.", if fresh == 1 { "" } else { "s" })).color(t.text_secondary).size(size::BODY_MD));
                 if ui_kit::pill_button(ui, Some(icons::DOWNLOAD), "Import", PillStyle::Soft).clicked() {
                     cx.actions.push(Action::ImportKotlinAddons);

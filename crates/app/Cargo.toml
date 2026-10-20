@@ -8,8 +8,10 @@ rust-version.workspace = true
 build = "build.rs"
 
 [dependencies]
+# The paste button reads the clipboard itself; egui only hands text over for Ctrl+V.
+arboard = { version = "3.7.0", default-features = false }
 anyhow = "1.0.104"
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "system_fonts"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "system_fonts", "clipboard"] }
 # Colour glyphs, so the emoji addons put in stream descriptions (folders, discs, flags) draw as the system font has them.
 epaint = { version = "0.37.0", default-features = false, features = ["color_fonts"] }
 fast_image_resize = "6.1.0"

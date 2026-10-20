@@ -35,5 +35,6 @@ pub const BOOKMARK_BORDER: char = '\u{e867}';
 pub const OPEN_IN_NEW: char = '\u{e89e}';
 pub const FOLDER: char = '\u{e2c7}';
 pub const DOWNLOAD: char = '\u{f090}';
+pub const LINK: char = '\u{e157}';
 pub const EXTENSION: char = '\u{e87b}';
 pub const PALETTE: char = '\u{e40a}';
