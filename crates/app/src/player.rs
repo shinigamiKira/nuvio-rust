@@ -9,9 +9,13 @@ use eframe::egui_glow;
 use nuvio_mpv::{EndReason, Event, Mpv, Observe, RenderContext, Value};
 use serde::Deserialize;
 
+use crate::mpv_custom::Custom;
+
 /// Seconds of media buffered before a stalled stream resumes. A first start needs less, a stall deserves more.
 const START_BUFFER_SECS: u32 = 1;
 const REBUFFER_SECS: u32 = 5;
+/// After a seek or a track change a stall resumes as soon as `START_BUFFER_SECS` are in, for this long.
+const QUICK_RESUME_FOR: Duration = Duration::from_secs(15);
 /// The Dolby Vision filter runs on 1920 px wide frames: at 4K it fell to 12 frames a second, at 1920 it keeps up.
 const DV_FILTER_WIDTH: i64 = 1920;
 /// How long to wait for mpv to report what the filter chain produced.
@@ -72,7 +76,7 @@ impl Track {
                 });
             }
         }
-        if parts.is_empty() { format!("Track {}", self.id) } else { parts.join(" Ã‚Â· ") }
+        if parts.is_empty() { format!("Track {}", self.id) } else { parts.join(" · ") }
     }
 }
 
@@ -147,7 +151,17 @@ pub struct Source {
     pub url: String,
     pub start: f64,
     pub headers: Vec<(String, String)>,
-    pub subtitles: Vec<String>,
+}
+
+/// A subtitle file from an addon, already downloaded. mpv opens a subtitle URL on the thread that plays, so playback
+/// freezes until the addon's server has answered; a file on disk loads at once.
+#[derive(Clone)]
+pub struct SubtitleFile {
+    pub path: String,
+    pub title: String,
+    pub language: String,
+    /// Switch to it now (the person picked it), instead of leaving the choice to mpv's language preferences.
+    pub select: bool,
 }
 
 /// Timing shared with mpv's threads: when it last announced a video frame, when that last repainted the window, and how
@@ -200,14 +214,18 @@ impl Clock {
 
 /// The GL half of the player, shared with the paint callback that runs inside egui's render pass.
 struct Surface {
+    /// First, so it is freed before the player it belongs to.
+    render: Mutex<Option<GlSide>>,
     mpv: Arc<Mpv>,
     clock: Clock,
     ctx: egui::Context,
-    render: Mutex<Option<GlSide>>,
     failed: Mutex<Option<String>>,
     /// Set once the render context exists. mpv refuses to open a video output before that, so a file is only loaded
     /// after it (the context can only be created inside a paint callback, where the GL context is current).
     ready: AtomicBool,
+    /// Set when the player is dropped. The frame that was being built still holds this surface in its paint callback,
+    /// and painting it must not make a new render context for a player that is shutting down.
+    closed: AtomicBool,
 }
 
 struct GlSide(RenderContext);
@@ -219,6 +237,9 @@ unsafe impl Send for GlSide {}
 impl Surface {
     fn paint(&self, info: &egui::PaintCallbackInfo) {
         let mut slot = self.render.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         if slot.is_none() {
             if self.failed.lock().map(|f| f.is_some()).unwrap_or(false) {
                 return;
@@ -257,7 +278,9 @@ impl Surface {
 
     /// Drops the render context. Needs the GL context current, which it is during a paint callback or `on_exit`.
     fn release(&self) {
-        self.render.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut slot = self.render.lock().unwrap_or_else(|e| e.into_inner());
+        self.closed.store(true, Ordering::Release);
+        slot.take();
     }
 }
 
@@ -292,13 +315,18 @@ pub struct Player {
     pub state: State,
     scratch: Vec<Event>,
     pending: Option<Source>,
-    rebuffer_raised: bool,
+    /// When to go back to waiting `REBUFFER_SECS` before resuming from a stall, after a stretch of resuming quickly.
+    rebuffer_at: Option<Instant>,
+    /// Subtitle files given to the player; mpv forgets them whenever the file is opened again.
+    external: Vec<SubtitleFile>,
+    buffering_since: Option<Instant>,
     opened: Instant,
     pub log_lines: Vec<String>,
+    custom: Custom,
 }
 
 impl Player {
-    pub fn new(ctx: &egui::Context, hardware_decoding: bool) -> nuvio_mpv::Result<Self> {
+    pub fn new(ctx: &egui::Context, hardware_decoding: bool, custom: Custom) -> nuvio_mpv::Result<Self> {
         let repaint = ctx.clone();
         let hwdec = std::env::var("NUVIO_MPV_HWDEC").unwrap_or_else(|_| if hardware_decoding { HARDWARE_DECODERS.into() } else { "no".into() });
         let vo = std::env::var("NUVIO_MPV_VO").unwrap_or_else(|_| "libmpv".into());
@@ -331,6 +359,8 @@ impl Player {
             ("save-position-on-quit".into(), "no".into()),
             ("config".into(), "no".into()),
         ];
+        // The person's own scripts, key bindings and options come after ours, so theirs win.
+        options.extend(custom.options.iter().cloned());
         if let Ok(extra) = std::env::var("NUVIO_MPV_OPTS") {
             for pair in extra.split(';').filter(|p| p.contains('=')) {
                 let (name, value) = pair.split_once('=').unwrap_or_default();
@@ -372,12 +402,13 @@ impl Player {
             mpv.observe(name, kind);
         }
         let surface = Arc::new(Surface {
+            render: Mutex::new(None),
             mpv: mpv.clone(),
             clock,
             ctx: ctx.clone(),
-            render: Mutex::new(None),
             failed: Mutex::new(None),
             ready: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         });
         Ok(Self {
             mpv,
@@ -393,10 +424,28 @@ impl Player {
             state: State { volume: 100.0, speed: 1.0, ..State::default() },
             scratch: Vec::new(),
             pending: None,
-            rebuffer_raised: false,
+            rebuffer_at: None,
+            external: Vec::new(),
+            buffering_since: None,
             opened: Instant::now(),
             log_lines: Vec::new(),
+            custom,
         })
+    }
+
+    /// The scripts and key bindings this player was started with.
+    pub fn custom(&self) -> &Custom {
+        &self.custom
+    }
+
+    /// A key press for mpv's own bindings and its scripts (`keypress`), by mpv's name for the key (`a`, `ctrl+LEFT`, `WHEEL_UP`).
+    pub fn send_key(&self, name: &str) {
+        let _ = self.mpv.command(&["keypress", name]);
+    }
+
+    /// Where the pointer is, in pixels of the window, for scripts that draw something under it.
+    pub fn send_mouse(&self, x: f32, y: f32) {
+        let _ = self.mpv.command(&["mouse", &(x.round() as i32).to_string(), &(y.round() as i32).to_string()]);
     }
 
     /// Opens a stream. The load starts on the first frame after the video surface exists.
@@ -423,7 +472,7 @@ impl Player {
     fn load(&mut self, source: &Source, extra: &[String], start: f64) {
         self.opened = Instant::now();
         self.state = State { volume: self.state.volume, muted: self.state.muted, speed: 1.0, ..State::default() };
-        self.rebuffer_raised = false;
+        self.rebuffer_at = None;
         self.last_extra = extra.to_vec();
         let _ = self.mpv.set_str("cache-pause-wait", &START_BUFFER_SECS.to_string());
         let headers: Vec<String> = source.headers.iter().map(|(name, value)| format!("{name}: {value}")).collect();
@@ -441,9 +490,6 @@ impl Player {
         };
         if let Err(error) = result {
             self.state.error = Some(error.to_string());
-        }
-        for subtitle in &source.subtitles {
-            let _ = self.mpv.command(&["sub-add", subtitle, "auto"]);
         }
     }
 
@@ -509,12 +555,31 @@ impl Player {
         let _ = self.mpv.set_bool("pause", paused);
     }
 
-    pub fn seek_to(&self, seconds: f64) {
-        let _ = self.mpv.command(&["seek", &format!("{seconds:.3}"), "absolute+exact"]);
+    pub fn seek_to(&mut self, seconds: f64) {
+        let mode = self.seek_mode(seconds);
+        self.resume_quickly();
+        let _ = self.mpv.command(&["seek", &format!("{seconds:.3}"), &format!("absolute+{mode}")]);
     }
 
-    pub fn seek_by(&self, seconds: f64) {
-        let _ = self.mpv.command(&["seek", &format!("{seconds:.3}"), "relative+exact"]);
+    pub fn seek_by(&mut self, seconds: f64) {
+        let mode = self.seek_mode(self.state.position + seconds);
+        self.resume_quickly();
+        let _ = self.mpv.command(&["seek", &format!("{seconds:.3}"), &format!("relative+{mode}")]);
+    }
+
+    /// A seek to a frame that is already read ahead is exact and costs nothing. Anywhere else an exact seek decodes from
+    /// the keyframe before the target, which reads up to a whole group of pictures over the network (ten seconds of video
+    /// in many files) before anything shows; landing on a keyframe shows a picture as soon as the data starts arriving.
+    fn seek_mode(&self, target: f64) -> &'static str {
+        let state = &self.state;
+        if target >= state.position && target <= state.position + state.cached_secs { "exact" } else { "keyframes" }
+    }
+
+    /// After a seek or a track change the buffer is empty, and the data has to come from the network again: resume
+    /// after a second of it instead of the `REBUFFER_SECS` that guards ordinary playback against stuttering.
+    fn resume_quickly(&mut self) {
+        let _ = self.mpv.set_str("cache-pause-wait", &START_BUFFER_SECS.to_string());
+        self.rebuffer_at = Some(Instant::now() + QUICK_RESUME_FOR);
     }
 
     pub fn set_volume(&mut self, volume: f64) {
@@ -532,11 +597,15 @@ impl Player {
         let _ = self.mpv.set_f64("speed", speed);
     }
 
-    pub fn select_audio(&self, id: i64) {
+    pub fn select_audio(&mut self, id: i64) {
+        self.resume_quickly();
         let _ = self.mpv.set_str("aid", &id.to_string());
     }
 
-    pub fn select_subtitle(&self, id: Option<i64>) {
+    pub fn select_subtitle(&mut self, id: Option<i64>) {
+        if id.is_some() {
+            self.resume_quickly();
+        }
         let _ = self.mpv.set_str("sid", &id.map(|i| i.to_string()).unwrap_or_else(|| "no".into()));
     }
 
@@ -560,9 +629,18 @@ impl Player {
         self.state.error = Some(message);
     }
 
-    /// Loads a subtitle file from an addon and switches to it.
-    pub fn add_subtitle(&self, url: &str, title: &str, language: &str) {
-        let _ = self.mpv.command(&["sub-add", url, "select", title, language]);
+    /// Hands the player a subtitle file. A file given before the video has opened is added once it has, and again if the
+    /// file is ever opened again.
+    pub fn add_subtitle(&mut self, file: SubtitleFile) {
+        if self.state.loaded {
+            self.send_subtitle(&file);
+        }
+        self.external.push(file);
+    }
+
+    fn send_subtitle(&self, file: &SubtitleFile) {
+        let flag = if file.select { "select" } else { "auto" };
+        let _ = self.mpv.command(&["sub-add", &file.path, flag, &file.title, &file.language]);
     }
 
     pub fn stop(&self) {
@@ -608,6 +686,9 @@ impl Player {
             match event {
                 Event::FileLoaded => {
                     self.state.loaded = true;
+                    for file in &self.external {
+                        self.send_subtitle(file);
+                    }
                     if self.dolby_vision == DolbyVision::Opening {
                         self.dolby_vision = DolbyVision::Verifying(Instant::now());
                     } else {
@@ -618,10 +699,7 @@ impl Player {
                     if !self.state.started {
                         self.state.started = true;
                         tracing::info!(ms = self.opened.elapsed().as_millis() as u64, "first frame");
-                    }
-                    if !self.rebuffer_raised {
-                        self.rebuffer_raised = true;
-                        let _ = self.mpv.set_str("cache-pause-wait", &REBUFFER_SECS.to_string());
+                        self.rebuffer_at = Some(Instant::now());
                     }
                 }
                 Event::EndFile { reason, error } => match reason {
@@ -645,6 +723,10 @@ impl Player {
         }
         self.scratch = events;
         self.verify_dolby_vision();
+        if self.rebuffer_at.is_some_and(|at| Instant::now() >= at) && !self.state.buffering {
+            self.rebuffer_at = None;
+            let _ = self.mpv.set_str("cache-pause-wait", &REBUFFER_SECS.to_string());
+        }
     }
 
     /// A network stream that ends long before its duration was cut off, not finished.
@@ -667,7 +749,21 @@ impl Player {
             ("time-pos", v) => self.state.position = v.as_f64().unwrap_or(self.state.position),
             ("duration", v) => self.state.duration = v.as_f64().unwrap_or(0.0),
             ("pause", Value::Flag(v)) => self.state.paused = *v,
-            ("paused-for-cache", Value::Flag(v)) => self.state.buffering = *v,
+            ("paused-for-cache", Value::Flag(v)) => {
+                // The log says how long each stall lasted, which is what a report of "it keeps buffering" needs.
+                match (*v, self.buffering_since) {
+                    (true, None) => {
+                        self.buffering_since = Some(Instant::now());
+                        tracing::info!(position = self.state.position as u64, "buffering");
+                    }
+                    (false, Some(since)) => {
+                        self.buffering_since = None;
+                        tracing::info!(ms = since.elapsed().as_millis() as u64, "buffering done");
+                    }
+                    _ => {}
+                }
+                self.state.buffering = *v;
+            }
             ("cache-buffering-state", Value::Int(v)) => self.state.buffer_percent = *v,
             ("demuxer-cache-time", v) => {
                 self.state.cached_secs = (v.as_f64().unwrap_or(0.0) - self.state.position).max(0.0);

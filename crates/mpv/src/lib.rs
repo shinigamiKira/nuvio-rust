@@ -390,11 +390,14 @@ pub struct RenderContext {
     api: Arc<sys::Api>,
     ctx: sys::RenderCtx,
     callback: Arc<UpdateCallback>,
+    /// mpv must outlive its render context: freeing the context after `mpv_terminate_destroy` has shut the core down
+    /// crashes inside libmpv. Declared last, so it is released after `Drop::drop` has freed the context.
+    _mpv: Arc<Mpv>,
 }
 
 impl RenderContext {
     /// `wake` runs on an mpv thread when a new frame is ready; it should request a repaint.
-    pub fn new_opengl(mpv: &Mpv, wake: impl Fn() + Send + Sync + 'static) -> Result<Self> {
+    pub fn new_opengl(mpv: &Arc<Mpv>, wake: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         let api = mpv.api.clone();
         let callback = Arc::new(UpdateCallback { changed: AtomicBool::new(true), wake: Box::new(wake) });
         let mut init = sys::OpenGlInitParams { get_proc_address: Some(gl::loader), get_proc_address_ctx: std::ptr::null_mut() };
@@ -412,7 +415,7 @@ impl RenderContext {
         let raw = Arc::as_ptr(&callback) as *mut c_void;
         // SAFETY: the Arc in `callback` keeps the pointee alive until `Drop` clears the callback.
         unsafe { (api.mpv_render_context_set_update_callback)(ctx, Some(render_update_trampoline), raw) };
-        Ok(Self { api, ctx, callback })
+        Ok(Self { api, ctx, callback, _mpv: mpv.clone() })
     }
 
     /// True when mpv has a frame that was not drawn yet. Must be called once per paint, before `render`, because

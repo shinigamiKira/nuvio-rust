@@ -10,17 +10,18 @@ use nuvio_core::http::Http;
 use nuvio_core::client::AddonClient;
 use nuvio_core::meta::{MetaDetails, MetaPreview};
 use nuvio_core::paths;
-use nuvio_core::store::{Progress, WindowState, unix_seconds};
+use nuvio_core::store::{ContinueItem, NextEpisode, Progress, WindowState, unix_seconds};
 use nuvio_core::stream::{Playback, Stream};
 use tokio::runtime::Handle;
 
 use crate::args::Args;
+use crate::compositor::Compositor;
 use crate::images::Images;
-use crate::player::{Player, Source};
-use crate::screens::player_view::{self, Session, Torrent};
-use crate::screens::{self, Action, Cx, PlayRequest, Route, Tab, ViewState, nav};
+use crate::player::{Player, Source, SubtitleFile};
+use crate::screens::player_view::{self, Carry, Session, SubtitlePick, Torrent};
+use crate::screens::{self, Action, Cx, PlayRequest, Route, Tab, ViewState, nav, opening};
 use crate::services::{Msg, Services};
-use crate::state::{State, StreamsState};
+use crate::state::{RefreshDue, State, StreamsState};
 use crate::theme;
 use crate::ui_kit::{self, glass_panel};
 
@@ -28,6 +29,7 @@ const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(10);
 const TOAST_FOR: Duration = Duration::from_millis(2800);
 
 pub struct App {
+    compositor: Compositor,
     args: Args,
     state: State,
     svc: Services,
@@ -41,6 +43,7 @@ pub struct App {
     screenshot_requested: bool,
     window: Option<WindowState>,
     auto_pick: Option<AutoPick>,
+    carried: Option<Carried>,
     opened_from_args: bool,
     keys_fired: Vec<usize>,
     logged_first_frame: bool,
@@ -50,18 +53,43 @@ pub struct App {
     frame_nr_before: u64,
     causes: std::collections::HashMap<String, u32>,
     frames_since: Instant,
+    /// Seconds between the starts of consecutive passes, and how long each pass took, for `NUVIO_PERF`.
+    gaps: Vec<f32>,
+    work: Vec<f32>,
+    last_pass: Option<Instant>,
 }
 
-/// After "next episode": play the stream that matches the one just watched as soon as the addon lists it.
+/// After "next episode" (or "previous"): the player screen stays up, showing the title as it does while a stream opens, until
+/// an addon lists the stream that matches the one just watched. That one is played with what the viewer had chosen.
 struct AutoPick {
     request: u64,
     binge_group: Option<String>,
     addon_id: String,
     resolution: Option<String>,
+    carry: Carry,
+    meta: Option<Arc<MetaDetails>>,
+    /// What the opening screen shows.
+    name: String,
+    artwork: Option<String>,
+    logo: Option<String>,
+    since: Instant,
+}
+
+/// What a stream that starts after another brings with it, see `App::play_episode`.
+struct Carried {
+    carry: Carry,
+    meta: Option<Arc<MetaDetails>>,
+    logo: Option<String>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, args: Args, runtime: Handle) -> Self {
+        if let Some(gl) = cc.gl.as_ref() {
+            use eframe::glow::HasContext as _;
+            // SAFETY: plain string queries on the window's current GL context.
+            let (renderer, version) = unsafe { (gl.get_parameter_string(eframe::glow::RENDERER), gl.get_parameter_string(eframe::glow::VERSION)) };
+            tracing::info!(renderer, version, "graphics");
+        }
         let state = State::load();
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme::Theme::new(theme::palette_by_id(&state.settings.theme), state.settings.amoled));
@@ -73,11 +101,13 @@ impl App {
         let client = AddonClient::new(http.clone(), DiskCache::new(paths::cache_dir().join("json")));
         let image_cache = DiskCache::new(paths::cache_dir().join("images"));
         image_cache.trim(400 * 1024 * 1024);
+        crate::subtitles::cache().trim(crate::subtitles::MAX_CACHE_BYTES);
         let images = Images::new(cc.egui_ctx.clone(), runtime.clone(), http, image_cache);
         let (tx, rx) = channel();
         let svc = Services::new(runtime, client, images, cc.egui_ctx.clone(), tx);
 
         let mut app = Self {
+            compositor: Compositor::start(),
             args,
             state,
             svc,
@@ -91,6 +121,7 @@ impl App {
             screenshot_requested: false,
             window: None,
             auto_pick: None,
+            carried: None,
             opened_from_args: false,
             keys_fired: Vec::new(),
             logged_first_frame: false,
@@ -100,6 +131,9 @@ impl App {
             frame_nr_before: 0,
             causes: Default::default(),
             frames_since: Instant::now(),
+            gaps: Vec::new(),
+            work: Vec::new(),
+            last_pass: None,
         };
         app.state.start_addons(&app.svc);
         if let Some(url) = app.args.play.clone() {
@@ -121,6 +155,23 @@ impl App {
                 let painted = ctx.cumulative_frame_nr() - self.frame_nr_before;
                 self.frame_nr_before = ctx.cumulative_frame_nr();
                 tracing::info!(passes = self.frames, painted, "frames in the last second");
+                let (mut gaps, mut work) = (std::mem::take(&mut self.gaps), std::mem::take(&mut self.work));
+                if gaps.len() > 2 {
+                    // How many gaps fall in each band, in ms: a smooth animation sits in one band.
+                    let band = |lo: f32, hi: f32| gaps.iter().filter(|g| **g * 1000.0 >= lo && **g * 1000.0 < hi).count();
+                    tracing::info!(under8 = band(0.0, 8.0), to14 = band(8.0, 14.0), to20 = band(14.0, 20.0), to26 = band(20.0, 26.0), to40 = band(26.0, 40.0), to100 = band(40.0, 100.0), "gap bands (ms)");
+                    gaps.sort_by(|a, b| a.total_cmp(b));
+                    work.sort_by(|a, b| a.total_cmp(b));
+                    let pick = |v: &Vec<f32>, q: f32| v[((v.len() - 1) as f32 * q) as usize] * 1000.0;
+                    tracing::info!(
+                        gap_median_ms = pick(&gaps, 0.5),
+                        gap_p95_ms = pick(&gaps, 0.95),
+                        gap_max_ms = pick(&gaps, 1.0),
+                        work_median_ms = pick(&work, 0.5),
+                        work_max_ms = pick(&work, 1.0),
+                        "pass spacing and cost"
+                    );
+                }
                 // What asked for them: the call sites that requested a repaint, most frequent first.
                 let mut causes: Vec<_> = self.causes.drain().collect();
                 causes.sort_by_key(|c| std::cmp::Reverse(c.1));
@@ -153,13 +204,34 @@ impl App {
                     self.subtitles_arrived(request, entries);
                     continue;
                 }
+                Msg::SubtitleFile { request, title, language, select, result } => {
+                    self.subtitle_downloaded(request, title, language, select, result);
+                    continue;
+                }
+                Msg::Segments { request, segments } => {
+                    if let Some(session) = self.session.as_mut().filter(|s| s.segments_request == request) {
+                        session.segments = segments;
+                    }
+                    continue;
+                }
                 _ => {}
             }
             let meta_for_streams = match &message {
                 Msg::Meta { result: Ok(meta), .. } => Some(meta.clone()),
                 _ => None,
             };
+            let was_signed_in = self.state.account.session.is_some();
             self.state.apply(message, &self.svc);
+            match (was_signed_in, self.state.account.session.as_ref()) {
+                (false, Some(session)) => {
+                    let who = session.email.clone().unwrap_or_else(|| "your account".into());
+                    self.view.account_email.clear();
+                    self.view.account_password.clear();
+                    self.push_toast(format!("Signed in as {who}"));
+                }
+                (true, None) => self.push_toast("Your session has ended. Sign in again."),
+                _ => {}
+            }
             if let Some(meta) = meta_for_streams {
                 self.fill_streams_from_meta(&meta);
             }
@@ -198,6 +270,7 @@ impl App {
             match action {
                 Action::Tab(tab) => {
                     self.stop_session();
+                    self.auto_pick = None;
                     self.routes = vec![Route::Tab(tab)];
                     if tab == Tab::Search {
                         self.view.search_focused = false;
@@ -208,8 +281,21 @@ impl App {
                     self.state.open_details(&self.svc, &kind, &id, preview);
                     self.routes.push(Route::Details);
                 }
+                Action::OpenSeason { kind, id, preview, season } => {
+                    self.state.open_details(&self.svc, &kind, &id, preview);
+                    if let Some(details) = self.state.details.as_mut() {
+                        details.season = Some(season);
+                    }
+                    self.routes.push(Route::Details);
+                }
+                Action::RemoveFromContinue { kind, id } => {
+                    self.state.progress.hide_title(&kind, &id);
+                    self.state.save_progress();
+                    self.push_toast("Removed from Continue Watching");
+                }
+                Action::PlayEpisode(video) => self.play_episode(video),
                 Action::OpenStreams { video } => self.open_streams(video),
-                Action::Resume(video_id) => self.resume(&video_id),
+                Action::Resume(item) => self.resume(*item),
                 Action::Play(request) => self.play(ctx, *request),
                 Action::ToggleLibrary(item) => {
                     let name = item.name.clone();
@@ -234,6 +320,22 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
                 }
                 Action::OpenExternal(url) => open_in_browser(&url),
+                Action::AddSubtitle { url, title, language } => {
+                    if let Some(request) = self.session.as_ref().map(|s| s.subtitles_request) {
+                        self.load_subtitle(request, url, title, language, true);
+                    }
+                }
+                Action::OpenAccount => {
+                    self.stop_session();
+                    self.auto_pick = None;
+                    self.routes = vec![Route::Tab(Tab::Settings)];
+                    self.view.settings_page = screens::settings::Page::Account;
+                }
+                Action::SignIn { email, password, create } => self.state.sign_in(&self.svc, email, password, create),
+                Action::SignOut => {
+                    self.state.sign_out(&self.svc);
+                    self.push_toast("Signed out");
+                }
             }
         }
     }
@@ -276,14 +378,13 @@ impl App {
     }
 
     fn open_streams(&mut self, video: Option<nuvio_core::meta::Video>) {
-        // Opening the next episode from inside the player replaces the player.
-        let remembered = self.session.as_ref().map(|s| (s.request.stream.clone(), s.meta.clone()));
         if matches!(self.current(), Route::Player) {
             self.stop_session();
             self.routes.pop();
         }
+        self.auto_pick = None;
         let Some(details) = self.state.details.as_ref() else { return };
-        let meta = details.meta.ready().cloned().or_else(|| remembered.as_ref().and_then(|(_, m)| m.clone()));
+        let meta = details.meta.ready().cloned();
         let preview = details.preview.clone();
         let (name, poster, background) = match (&meta, &preview) {
             (Some(m), _) => (m.name.clone(), m.poster.clone(), m.background.clone()),
@@ -305,21 +406,57 @@ impl App {
             selection: Default::default(),
         };
         self.state.open_streams(&self.svc, state);
-        let request = self.state.streams.as_ref().map(|s| s.request).unwrap_or(0);
-        self.auto_pick = remembered.filter(|_| self.state.settings.auto_play_next).map(|(stream, _)| AutoPick {
-            request,
-            binge_group: stream.binge_group.clone(),
-            addon_id: stream.addon_id.clone(),
-            resolution: stream.facet_values().get(&nuvio_core::stream::Facet::Resolution).and_then(|v| v.first().cloned()),
-        });
         if !matches!(self.current(), Route::Streams) {
             self.routes.push(Route::Streams);
         }
     }
 
-    /// Continue Watching: open the stream list of the saved episode.
-    fn resume(&mut self, video_id: &str) {
-        let Some(progress) = self.state.progress.get(video_id).cloned() else { return };
+    /// "Next episode" and "Previous episode" in the player, and the card that offers the next one: the other episode opens
+    /// without leaving the player. Its stream is the one that matches what was playing (the same binge group, else the same
+    /// addon at the same resolution), the volume, audio track, subtitles, speed and picture size are the ones the viewer had,
+    /// and the screen in between is the one shown while any stream opens. Only when no stream matches does the list open.
+    fn play_episode(&mut self, video: nuvio_core::meta::Video) {
+        let Some(session) = self.session.as_ref() else { return };
+        let carry = session.carry_out();
+        let previous = session.request.stream.clone();
+        let request = &session.request;
+        let state = StreamsState {
+            kind: request.kind.clone(),
+            title_id: request.title_id.clone(),
+            video_id: video.id.clone(),
+            name: request.name.clone(),
+            episode_label: video.code(),
+            episode_title: Some(video.title.clone()).filter(|t| !t.is_empty()),
+            poster: request.poster.clone(),
+            background: request.background.clone(),
+            meta: session.meta.clone(),
+            request: 0,
+            groups: Vec::new(),
+            selection: Default::default(),
+        };
+        let (meta, logo) = (session.meta.clone(), session.logo.clone());
+        let (name, artwork) = (request.name.clone(), request.background.clone().or_else(|| request.poster.clone()));
+        // Saves how far the episode that is being left got.
+        self.stop_session();
+        self.state.open_streams(&self.svc, state);
+        let request = self.state.streams.as_ref().map(|s| s.request).unwrap_or(0);
+        self.auto_pick = Some(AutoPick {
+            request,
+            binge_group: previous.binge_group.clone(),
+            addon_id: previous.addon_id.clone(),
+            resolution: previous.facet_values().get(&nuvio_core::stream::Facet::Resolution).and_then(|v| v.first().cloned()),
+            carry,
+            meta,
+            name,
+            artwork,
+            logo,
+            since: Instant::now(),
+        });
+    }
+
+    /// Continue Watching: open the stream list of the saved episode, or of the one after it.
+    fn resume(&mut self, item: ContinueItem) {
+        let progress = item.progress.clone();
         let preview = MetaPreview {
             id: progress.id.clone(),
             kind: progress.kind.clone(),
@@ -332,10 +469,10 @@ impl App {
         let state = StreamsState {
             kind: progress.kind.clone(),
             title_id: progress.id.clone(),
-            video_id: progress.video_id.clone(),
+            video_id: item.video_id().to_owned(),
             name: progress.name.clone(),
-            episode_label: progress.season.zip(progress.episode).map(|(s, e)| format!("S{s} E{e}")),
-            episode_title: progress.episode_title.clone(),
+            episode_label: item.season().zip(item.episode()).map(|(s, e)| format!("S{s} E{e}")),
+            episode_title: item.episode_title().map(str::to_owned),
             poster: progress.poster.clone(),
             background: progress.background.clone(),
             meta: None,
@@ -364,49 +501,83 @@ impl App {
         }
     }
 
-    fn start_player(&mut self, ctx: &egui::Context, request: PlayRequest, url: String) {
+    /// A player with the settings applied. `carried` is what the episode before it left behind (volume, speed, the languages
+    /// of the audio and the subtitles), which wins over the settings.
+    fn make_player(&mut self, ctx: &egui::Context, carried: Option<&Carried>) -> Option<Player> {
         let settings = &self.state.settings;
-        let mut player = match Player::new(ctx, settings.hardware_decoding) {
+        let mut player = match Player::new(ctx, settings.hardware_decoding, crate::mpv_custom::Custom::load(settings)) {
             Ok(player) => player,
             Err(error) => {
                 self.push_toast(format!("The player could not start: {error}"));
-                return;
+                return None;
             }
         };
-        player.set_volume(settings.volume);
-        player.set_track_preferences(&settings.preferred_audio_language, &settings.preferred_subtitle_language, settings.subtitles_on);
+        let settings = &self.state.settings;
+        player.set_volume(carried.map_or(settings.volume, |c| c.carry.volume));
+        let (audio, subtitles, subtitles_on) = match carried {
+            Some(c) => c.carry.track_preferences(settings),
+            None => (settings.preferred_audio_language.clone(), settings.preferred_subtitle_language.clone(), settings.subtitles_on),
+        };
+        player.set_track_preferences(&audio, &subtitles, subtitles_on);
+        if let Some(c) = carried {
+            player.set_muted(c.carry.muted);
+            player.set_speed(c.carry.speed);
+        }
+        Some(player)
+    }
+
+    /// Asks IntroDB where the intro and the credits of an episode are. The answer arrives as `Msg::Segments`; a title that is
+    /// not a series with an IMDb id, or an episode nobody has marked, gets none.
+    fn fetch_segments(&mut self, request: &PlayRequest) -> u64 {
+        let id = self.state.request_id();
+        let mut parts = request.video_id.split(':');
+        let imdb = parts.next().filter(|id| id.starts_with("tt") && id.len() > 2 && id.bytes().skip(2).all(|b| b.is_ascii_digit())).map(str::to_owned);
+        let season = request.video.as_ref().and_then(|v| v.season).or_else(|| parts.next().and_then(|s| s.parse().ok()));
+        let episode = request.video.as_ref().and_then(|v| v.episode).or_else(|| parts.next().and_then(|e| e.parse().ok()));
+        if let (Some(imdb), Some(season), Some(episode)) = (imdb, season, episode) {
+            let http = self.svc.client.http().clone();
+            self.svc.spawn(async move {
+                let segments = nuvio_core::segments::fetch(&http, &imdb, season, episode).await.unwrap_or_default();
+                Msg::Segments { request: id, segments }
+            });
+        }
+        id
+    }
+
+    fn start_player(&mut self, ctx: &egui::Context, request: PlayRequest, url: String) {
+        let carried = self.carried.take();
+        let Some(mut player) = self.make_player(ctx, carried.as_ref()) else { return };
         let start = self.state.progress.get(&request.video_id).filter(|p| p.is_resumable()).map(|p| p.position).unwrap_or(0.0);
-        player.open(Source {
-            url,
-            start: if self.args.start > 0.0 { self.args.start } else { start },
-            headers: request.stream.request_headers.clone(),
-            subtitles: request.stream.subtitles.iter().map(|s| s.url.clone()).collect(),
-        });
-        let meta = self.state.details.as_ref().and_then(|d| d.meta.ready().cloned()).filter(|m| m.id == request.title_id);
+        player.open(Source { url, start: if self.args.start > 0.0 { self.args.start } else { start }, headers: request.stream.request_headers.clone() });
+        let meta = self.state.details.as_ref().and_then(|d| d.meta.ready().cloned()).or_else(|| carried.as_ref().and_then(|c| c.meta.clone())).filter(|m| m.id == request.title_id);
         let subtitles_request = self.fetch_subtitles(&request);
+        let segments_request = self.fetch_segments(&request);
         let mut session = Session::new(player, request, meta);
         session.subtitles_request = subtitles_request;
+        session.segments_request = segments_request;
+        session.logo = session.logo.take().or_else(|| carried.as_ref().and_then(|c| c.logo.clone())).or_else(|| self.preview_logo());
+        if let Some(carried) = carried {
+            session.take_carry(carried.carry);
+        }
         self.session = Some(session);
+        crate::platform::playback(true);
         self.auto_pick = None;
         if !matches!(self.current(), Route::Player) {
             self.routes.push(Route::Player);
         }
     }
 
+    /// The wordmark of the title being opened, from the catalog entry it was picked from, while its details load.
+    fn preview_logo(&self) -> Option<String> {
+        self.state.details.as_ref().and_then(|d| d.preview.as_ref()).and_then(|p| p.logo.clone())
+    }
+
     /// A torrent: the player opens now (its video surface has to exist before a file loads), and the file follows when
     /// the swarm has been found and the first pieces chosen.
     fn start_torrent(&mut self, ctx: &egui::Context, request: PlayRequest, info_hash: String, file_idx: Option<i64>, trackers: Vec<String>) {
-        let settings = &self.state.settings;
-        let mut player = match Player::new(ctx, settings.hardware_decoding) {
-            Ok(player) => player,
-            Err(error) => {
-                self.push_toast(format!("The player could not start: {error}"));
-                return;
-            }
-        };
-        player.set_volume(settings.volume);
-        player.set_track_preferences(&settings.preferred_audio_language, &settings.preferred_subtitle_language, settings.subtitles_on);
-        let meta = self.state.details.as_ref().and_then(|d| d.meta.ready().cloned()).filter(|m| m.id == request.title_id);
+        let carried = self.carried.take();
+        let Some(player) = self.make_player(ctx, carried.as_ref()) else { return };
+        let meta = self.state.details.as_ref().and_then(|d| d.meta.ready().cloned()).or_else(|| carried.as_ref().and_then(|c| c.meta.clone())).filter(|m| m.id == request.title_id);
         let torrent_request = self.state.request_id();
         let status = crate::p2p::Status::new();
         let wanted = crate::p2p::Request {
@@ -417,10 +588,17 @@ impl App {
             episode: request.video.as_ref().and_then(|v| v.episode),
         };
         let subtitles_request = self.fetch_subtitles(&request);
+        let segments_request = self.fetch_segments(&request);
         let mut session = Session::new(player, request, meta);
         session.subtitles_request = subtitles_request;
+        session.segments_request = segments_request;
+        session.logo = session.logo.take().or_else(|| carried.as_ref().and_then(|c| c.logo.clone())).or_else(|| self.preview_logo());
+        if let Some(carried) = carried {
+            session.take_carry(carried.carry);
+        }
         session.torrent = Some(Torrent { request: torrent_request, status: status.clone(), info_hash });
         self.session = Some(session);
+        crate::platform::playback(true);
         self.auto_pick = None;
         if !matches!(self.current(), Route::Player) {
             self.routes.push(Route::Player);
@@ -445,23 +623,71 @@ impl App {
                 Msg::Subtitles { request: id, entries }
             });
         }
+        // Subtitles the stream itself came with.
+        for subtitle in &request.stream.subtitles {
+            let title = match crate::player::language_label(&subtitle.language) {
+                label if label.is_empty() => "Subtitles".to_owned(),
+                label => label,
+            };
+            self.load_subtitle(id, subtitle.url.clone(), title, subtitle.language.clone(), false);
+        }
         id
     }
 
-    fn subtitles_arrived(&mut self, request: u64, entries: Vec<nuvio_core::stream::AddonSubtitle>) {
-        let preferred = self.state.settings.preferred_subtitle_language.clone();
-        let wanted = self.state.settings.subtitles_on;
+    /// Downloads a subtitle file in the background. It reaches the player as `Msg::SubtitleFile`.
+    fn load_subtitle(&self, request: u64, url: String, title: String, language: String, select: bool) {
+        let client = self.svc.client.clone();
+        self.svc.spawn(async move {
+            let result = crate::subtitles::download(&client, &url).await;
+            Msg::SubtitleFile { request, title, language, select, result }
+        });
+    }
+
+    fn subtitle_downloaded(&mut self, request: u64, title: String, language: String, select: bool, result: Result<String, String>) {
         let Some(session) = self.session.as_mut().filter(|s| s.subtitles_request == request) else { return };
+        match result {
+            Ok(path) => session.player.add_subtitle(SubtitleFile { path, title, language, select }),
+            Err(error) => {
+                tracing::warn!(%error, "could not load a subtitle file");
+                if select {
+                    self.push_toast("That subtitle could not be loaded");
+                }
+            }
+        }
+    }
+
+    fn subtitles_arrived(&mut self, request: u64, entries: Vec<nuvio_core::stream::AddonSubtitle>) {
+        let mut preferred = self.state.settings.preferred_subtitle_language.clone();
+        let mut wanted = self.state.settings.subtitles_on;
+        let Some(session) = self.session.as_mut().filter(|s| s.subtitles_request == request) else { return };
+        // After another episode, the subtitles that were on there (or off) decide, and the addon they came from is preferred.
+        let mut preferred_addon = None;
+        match session.carry.as_ref().map(|c| &c.subtitles) {
+            Some(SubtitlePick::On { language, addon, .. }) => {
+                wanted = true;
+                if let Some(language) = language {
+                    preferred = language.clone();
+                }
+                preferred_addon = addon.clone();
+            }
+            Some(SubtitlePick::Off) => wanted = false,
+            _ => {}
+        }
         session.online_subtitles.extend(entries);
         // With subtitles switched on by default and none in the file in that language, take the first one an addon has.
         let has_selected = session.player.tracks_of("sub").any(|t| t.selected);
+        let mut chosen = None;
         if wanted && !has_selected && !session.subtitle_chosen && !preferred.is_empty() {
             let wanted_name = crate::player::language_label(&preferred);
-            if let Some(subtitle) = session.online_subtitles.iter().find(|s| crate::player::language_label(&s.language) == wanted_name).cloned() {
+            let matching = |s: &&nuvio_core::stream::AddonSubtitle| crate::player::language_label(&s.language) == wanted_name;
+            let from_addon = preferred_addon.as_ref().and_then(|addon| session.online_subtitles.iter().filter(matching).find(|s| &s.addon == addon));
+            if let Some(subtitle) = from_addon.or_else(|| session.online_subtitles.iter().find(matching)).cloned() {
                 session.subtitle_chosen = true;
-                let label = format!("{} · {}", wanted_name, subtitle.addon);
-                session.player.add_subtitle(&subtitle.url, &label, &subtitle.language);
+                chosen = Some((subtitle.url, format!("{} · {}", wanted_name, subtitle.addon), subtitle.language));
             }
+        }
+        if let Some((url, label, language)) = chosen {
+            self.load_subtitle(request, url, label, language, true);
         }
     }
 
@@ -474,12 +700,7 @@ impl App {
         match result {
             Ok(url) => {
                 let resume = self.state.progress.get(&session.request.video_id).filter(|p| p.is_resumable()).map(|p| p.position).unwrap_or(0.0);
-                session.player.open(Source {
-                    url,
-                    start: if start_override > 0.0 { start_override } else { resume },
-                    headers: Vec::new(),
-                    subtitles: session.request.stream.subtitles.iter().map(|s| s.url.clone()).collect(),
-                });
+                session.player.open(Source { url, start: if start_override > 0.0 { start_override } else { resume }, headers: Vec::new() });
             }
             Err(error) => session.player.fail(error),
         }
@@ -488,6 +709,7 @@ impl App {
     /// Records how far the viewer got and releases the player.
     fn stop_session(&mut self) {
         self.save_progress(true);
+        crate::platform::playback(false);
         if let Some(session) = self.session.take() {
             if let Some(torrent) = &session.torrent {
                 torrent.status.stop();
@@ -515,6 +737,7 @@ impl App {
         }
         session.last_saved = Instant::now();
         let request = &session.request;
+        let next = session.next_episode().map(|v| NextEpisode { video_id: v.id.clone(), season: v.season, episode: v.episode, title: Some(v.title.clone()).filter(|t| !t.is_empty()) });
         let position = if state.ended { state.duration } else { state.position };
         self.state.progress.record(Progress {
             kind: request.kind.clone(),
@@ -529,6 +752,7 @@ impl App {
             position,
             duration: state.duration,
             updated_at: unix_seconds(),
+            next,
         });
         self.state.save_progress();
     }
@@ -558,28 +782,52 @@ impl App {
                     video,
                     stream,
                 };
-                self.auto_pick = None;
+                if let Some(pick) = self.auto_pick.take() {
+                    self.carried = Some(Carried { carry: pick.carry, meta: pick.meta, logo: pick.logo });
+                }
                 self.play(ctx, request);
+                self.carried = None;
             }
-            None if finished => self.auto_pick = None,
+            // Every addon has answered and none has the stream that was playing: the list is for the viewer to choose from,
+            // never a stream picked at random.
+            None if finished => {
+                self.auto_pick = None;
+                if matches!(self.current(), Route::Player) && self.session.is_none() {
+                    self.routes.pop();
+                    if !matches!(self.current(), Route::Streams) {
+                        self.routes.push(Route::Streams);
+                    }
+                    self.push_toast("The stream you were watching is not available for this episode. Pick another.");
+                }
+            }
             None => {}
         }
     }
 
-    /// `--play <url>`: open the player on a bare URL with no title behind it.
+    /// `--play <url>`: open the player on a bare URL with no title behind it. `NUVIO_TEST_TITLE`, `NUVIO_TEST_BACKGROUND` and
+    /// `NUVIO_TEST_LOGO` give it a name, artwork and a wordmark, to look at the screen shown while a stream opens, and
+    /// `NUVIO_TEST_SUBTITLES=<n>` makes n addon subtitles appear in the Subtitles menu.
     fn play_test_url(&mut self, ctx: &egui::Context, url: String) {
-        let name = url.rsplit(['/', '\\']).next().unwrap_or("Video").split('?').next().unwrap_or("Video").to_owned();
+        let name = std::env::var("NUVIO_TEST_TITLE").unwrap_or_else(|_| url.rsplit(['/', '\\']).next().unwrap_or("Video").split('?').next().unwrap_or("Video").to_owned());
         let request = PlayRequest {
             kind: "movie".into(),
             title_id: "test".into(),
             video_id: "test".into(),
             name,
             poster: None,
-            background: None,
+            background: std::env::var("NUVIO_TEST_BACKGROUND").ok(),
             video: None,
             stream: Stream { url: Some(url.clone()), ..Stream::default() },
         };
         self.play(ctx, request);
+        if let Some(session) = &mut self.session {
+            session.logo = std::env::var("NUVIO_TEST_LOGO").ok();
+            let count = std::env::var("NUVIO_TEST_SUBTITLES").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+            const LANGUAGES: [&str; 8] = ["eng", "spa", "fre", "ger", "ita", "por", "jpn", "kor"];
+            session.online_subtitles = (0..count)
+                .map(|i| nuvio_core::stream::AddonSubtitle { addon: format!("Test addon {}", i / LANGUAGES.len() + 1), language: LANGUAGES[i % LANGUAGES.len()].into(), url: format!("http://127.0.0.1:9/{i}.srt") })
+                .collect();
+        }
     }
 
     // -- development hooks (see args.rs) -----------------------------------------------------------------------------
@@ -609,6 +857,7 @@ impl App {
                     Some("appearance") => screens::settings::Page::Appearance,
                     Some("storage") => screens::settings::Page::Storage,
                     Some("about") => screens::settings::Page::About,
+                    Some("account") => screens::settings::Page::Account,
                     _ => screens::settings::Page::Addons,
                 };
             }
@@ -683,6 +932,16 @@ impl App {
         }
     }
 
+    /// Keeps the signed-in session fresh: renews it shortly before its access token runs out, and wakes the window for that
+    /// moment and no other.
+    fn drive_account(&mut self, ctx: &egui::Context) {
+        match self.state.account.refresh_due() {
+            RefreshDue::Now => self.state.refresh_session(&self.svc),
+            RefreshDue::In(wait) => ctx.request_repaint_after(wait.min(Duration::from_secs(3600))),
+            RefreshDue::Never => {}
+        }
+    }
+
     fn track_window(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
             let viewport = i.viewport();
@@ -723,7 +982,15 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Each frame starts right after the compositor's last pass; see `compositor.rs`.
+        self.compositor.wait_for_pass();
         let ctx = ui.ctx().clone();
+        let began = Instant::now();
+        if self.perf {
+            if let Some(last) = self.last_pass.replace(began) {
+                self.gaps.push((began - last).as_secs_f32());
+            }
+        }
         self.log_milestones(&ctx);
         self.drain_messages();
         self.svc.images.begin_frame();
@@ -749,11 +1016,21 @@ impl eframe::App for App {
         }
         if route == Route::Player {
             if let Some(session) = &mut self.session {
-                player_view::show(session, ui, &mut self.actions, self.view.fullscreen, self.state.settings.auto_play_next);
+                player_view::show(session, ui, &self.svc.images, &mut self.actions, self.view.fullscreen, self.state.settings.auto_play_next, self.state.settings.auto_skip_segments);
+            } else if let Some(pick) = &self.auto_pick {
+                // Between two episodes: the title, as while any stream opens, until the stream that matches has answered.
+                let rect = ui.max_rect();
+                let content = opening::Opening { artwork: pick.artwork.as_deref(), logo: pick.logo.as_deref(), title: &pick.name, message: Some("Finding the same stream for the next episode…") };
+                if opening::show(ui, rect, &self.svc.images, &content, pick.since.elapsed().as_secs_f32(), 1.0) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.actions.push(Action::Back);
+                }
             }
         } else if let Route::Tab(tab) = route {
             if let Some(clicked) = nav::show(&ctx, tab) {
                 self.actions.push(Action::Tab(clicked));
+            }
+            if nav::account_button(&ctx, self.state.account.session.as_ref().map(|s| s.email.as_deref().unwrap_or("?"))) {
+                self.actions.push(Action::OpenAccount);
             }
             // Escape and the mouse's back button leave a page, never a root tab.
         } else if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.button_pressed(egui::PointerButton::Extra1)) && !ctx.memory(|m| m.focused().is_some()) {
@@ -767,10 +1044,14 @@ impl eframe::App for App {
         self.global_shortcuts(&ctx, &route);
         self.run_auto_pick(&ctx);
         self.save_progress(false);
+        self.drive_account(&ctx);
         self.drive_tests(&ctx);
         self.track_window(&ctx);
         self.toasts_ui(&ctx);
         self.apply_actions(&ctx);
+        if self.perf {
+            self.work.push(began.elapsed().as_secs_f32());
+        }
     }
 
     /// `--mouse x,y`: a pointer that keeps moving by a pixel, so hover states and the player's controls show up in
@@ -803,7 +1084,14 @@ impl eframe::App for App {
                 }
             }
         }
-        if !self.args.keys.is_empty() || !self.args.clicks.is_empty() {
+        for (index, (at, text)) in self.args.texts.iter().enumerate() {
+            let slot = 2000 + index;
+            if elapsed >= *at && !self.keys_fired.contains(&slot) {
+                self.keys_fired.push(slot);
+                raw_input.events.push(egui::Event::Text(text.clone()));
+            }
+        }
+        if !self.args.keys.is_empty() || !self.args.clicks.is_empty() || !self.args.texts.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }

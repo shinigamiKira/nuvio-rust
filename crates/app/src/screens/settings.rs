@@ -8,10 +8,11 @@ use super::{Action, Cx};
 use crate::icons;
 use crate::state::Load;
 use crate::theme::{self, PALETTES, radius, size};
-use crate::ui_kit::{self, PillStyle, animate, page_padding, radius_of, switch_row, text_field, with_alpha};
+use crate::ui_kit::{self, PillStyle, animate, page_padding, password_field, radius_of, switch_row, text_field, with_alpha};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
+    Account,
     Addons,
     Playback,
     Appearance,
@@ -19,7 +20,8 @@ pub enum Page {
     About,
 }
 
-const PAGES: [(Page, char, &str); 5] = [
+const PAGES: [(Page, char, &str); 6] = [
+    (Page::Account, icons::PERSON, "Account"),
     (Page::Addons, icons::EXTENSION, "Addons"),
     (Page::Playback, icons::PLAY, "Playback"),
     (Page::Appearance, icons::PALETTE, "Appearance"),
@@ -65,6 +67,7 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
         ui.set_max_width(content.width().min(780.0));
         ui.spacing_mut().item_spacing.y = 6.0;
         match cx.view.settings_page {
+            Page::Account => account(cx, ui),
             Page::Addons => addons(cx, ui),
             Page::Playback => playback(cx, ui),
             Page::Appearance => appearance(cx, ui),
@@ -87,6 +90,86 @@ fn note(ui: &mut Ui, text: &str) {
     let g = ui_kit::galley(ui, text, theme::regular(size::BODY_SM), t.text_muted, ui.available_width(), 6);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), g.size().y + 6.0), Sense::hover());
     ui.painter().galley(rect.min, g, t.text_muted);
+}
+
+/// Sign in, make an account, or sign out. The sign-in goes to the official Nuvio account server.
+fn account(cx: &mut Cx, ui: &mut Ui) {
+    let t = theme::get();
+    heading(ui, "Account");
+    if let Some(session) = cx.state.account.session.clone() {
+        let email = session.email.clone().unwrap_or_else(|| "Your account".into());
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 92.0), Sense::hover());
+        ui.painter().rect_filled(rect, radius_of(radius::POSTER + 4.0), with_alpha(Color32::WHITE, 0.05));
+        let badge = Rect::from_center_size(rect.left_center() + vec2(46.0, 0.0), vec2(56.0, 56.0));
+        ui.painter().circle_filled(badge.center(), 28.0, t.accent);
+        let initial = email.chars().next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_else(|| "?".into());
+        ui_kit::draw_text(ui, badge.center(), Align2::CENTER_CENTER, &initial, theme::bold(size::TITLE_MD), t.on_accent);
+        ui_kit::draw_text(ui, pos2(badge.right() + 18.0, rect.center().y - 11.0), Align2::LEFT_CENTER, &email, theme::bold(size::BODY_LG), t.text);
+        ui_kit::draw_text(ui, pos2(badge.right() + 18.0, rect.center().y + 12.0), Align2::LEFT_CENTER, &format!("Signed in to {}", session.server.host()), theme::regular(size::BODY_SM), t.text_muted);
+        ui.add_space(14.0);
+        if ui_kit::pill_button(ui, Some(icons::LOGOUT), "Sign out", PillStyle::Soft).clicked() {
+            cx.actions.push(Action::SignOut);
+        }
+        ui.add_space(12.0);
+        note(ui, "Your library, watch progress and addons are kept on this computer. Syncing them through the account is not part of this version yet.");
+        return;
+    }
+
+    let create = cx.view.account_create;
+    note(ui, if create { "Make a Nuvio account." } else { "Sign in with your Nuvio account." });
+    ui.add_space(10.0);
+    let busy = cx.state.account.busy;
+    let field_w = ui.available_width().min(440.0);
+    let email = text_field(ui, &mut cx.view.account_email, "Email", field_w);
+    ui.add_space(4.0);
+    let password = password_field(ui, &mut cx.view.account_password, "Password", field_w);
+    let entered = email.lost_focus() || password.lost_focus();
+    let enter_pressed = entered && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    ui.add_space(10.0);
+
+    let ready = !cx.view.account_email.trim().is_empty() && !cx.view.account_password.is_empty();
+    ui.horizontal(|ui| {
+        ui.set_min_height(42.0);
+        let label = match (busy, create) {
+            (true, true) => "Creating the account…",
+            (true, false) => "Signing in…",
+            (false, true) => "Create account",
+            (false, false) => "Sign in",
+        };
+        let submit = ui_kit::pill_button(ui, None, label, PillStyle::Primary).clicked() || enter_pressed;
+        if busy {
+            let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+            ui_kit::spinner(ui, r.center(), 9.0, t.text_muted);
+        } else if submit {
+            if ready {
+                let email = cx.view.account_email.trim().to_owned();
+                cx.actions.push(Action::SignIn { email, password: cx.view.account_password.clone(), create });
+            } else {
+                cx.state.account.error = Some("Enter your email address and password.".into());
+            }
+        }
+    });
+    if let Some(error) = &cx.state.account.error {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(error).color(t.danger).size(size::BODY_SM));
+    }
+    if let Some(notice) = &cx.state.account.notice {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(notice).color(t.text_secondary).size(size::BODY_SM));
+    }
+
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        ui.set_min_height(34.0);
+        ui.label(egui::RichText::new(if create { "Already have an account?" } else { "Don't have an account?" }).color(t.text_muted).size(size::BODY_MD));
+        if ui_kit::chip(ui, if create { "Sign in" } else { "Sign up" }, false).clicked() {
+            cx.view.account_create = !create;
+            cx.state.account.error = None;
+            cx.state.account.notice = None;
+        }
+    });
+    ui.add_space(8.0);
+    note(ui, "Everything works without an account. Your library, watch progress and addons are kept on this computer, and syncing them through the account is not part of this version yet.");
 }
 
 fn addons(cx: &mut Cx, ui: &mut Ui) {
@@ -244,7 +327,8 @@ fn playback(cx: &mut Cx, ui: &mut Ui) {
     heading(ui, "Playback");
     let mut changed = false;
     changed |= switch_row(ui, "Hardware decoding", Some("Decode video on the graphics card. Turn off if a stream shows artefacts or stutters."), &mut cx.state.settings.hardware_decoding);
-    changed |= switch_row(ui, "Play the next episode automatically", Some("When an episode ends, open the next one."), &mut cx.state.settings.auto_play_next);
+    changed |= switch_row(ui, "Play the next episode automatically", Some("When the credits roll, open the next episode, with the same stream and the same audio, subtitles and volume."), &mut cx.state.settings.auto_play_next);
+    changed |= switch_row(ui, "Skip intros and credits automatically", Some("A few seconds after an intro, a recap or the end credits begin, skip them. Where the episode is not marked, the credits are taken to be the last seconds."), &mut cx.state.settings.auto_skip_segments);
     changed |= switch_row(ui, "Subtitles on by default", Some("Turn on the preferred subtitle language when a stream has it."), &mut cx.state.settings.subtitles_on);
     ui.add_space(10.0);
     changed |= language_picker(ui, "Preferred audio language", &mut cx.state.settings.preferred_audio_language, "audio-lang");
@@ -253,6 +337,59 @@ fn playback(cx: &mut Cx, ui: &mut Ui) {
         cx.state.save_settings();
     }
     note(ui, "Hardware decoding takes effect the next time a stream is opened.");
+    custom_mpv(cx, ui);
+}
+
+/// Scripts, key bindings and options of the person's own for the player.
+fn custom_mpv(cx: &mut Cx, ui: &mut Ui) {
+    let t = theme::get();
+    ui.add_space(22.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+    ui_kit::draw_text(ui, rect.left_center(), Align2::LEFT_CENTER, "Custom mpv scripts", theme::bold(size::TITLE_SM), t.text);
+    note(ui, "Put Lua or JavaScript scripts in the folder's scripts folder, key bindings in its input.conf and script settings in script-opts, as for mpv itself. Key presses Nuvio has no use for go to the scripts, and what they draw (an on-screen display, a message) appears over the picture.");
+    let mut changed = false;
+    changed |= switch_row(ui, "Custom mpv scripts and key bindings", Some("Load them when a stream opens. Takes effect the next time a stream is opened."), &mut cx.state.settings.mpv_scripts);
+    if cx.state.settings.mpv_scripts {
+        changed |= switch_row(ui, "mpv's on-screen messages", Some("Show what mpv says about changes your own key bindings make (volume, seeking, track). Scripts can always draw."), &mut cx.state.settings.mpv_osd);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui_kit::pill_button(ui, Some(icons::FOLDER), "Open mpv folder", PillStyle::Soft).clicked() {
+                let dir = crate::mpv_custom::ensure_folder();
+                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+            }
+            if ui_kit::pill_button(ui, Some(icons::KEYBOARD), "Edit input.conf", PillStyle::Soft).clicked() {
+                let dir = crate::mpv_custom::ensure_folder();
+                let _ = std::process::Command::new("notepad").arg(dir.join("input.conf")).spawn();
+            }
+        });
+        ui.add_space(8.0);
+        let scripts = crate::mpv_custom::scripts();
+        let found = if scripts.is_empty() {
+            "No scripts found yet.".to_owned()
+        } else {
+            let names: Vec<String> = scripts.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+            format!("Found {}: {}", if scripts.len() == 1 { "1 script".to_owned() } else { format!("{} scripts", scripts.len()) }, names.join(", "))
+        };
+        note(ui, &found);
+        note(ui, &format!("Folder: {}", crate::mpv_custom::dir().display()));
+        ui.add_space(6.0);
+        note(ui, "More mpv options, one name=value per line (volume-max=200, deband=yes). Applied when a stream is opened.");
+        let (box_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), Sense::hover());
+        ui.painter().rect_filled(box_rect, radius_of(radius::POSTER), with_alpha(Color32::WHITE, 0.06));
+        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(box_rect.shrink2(vec2(14.0, 10.0))).layout(egui::Layout::top_down(egui::Align::Min)));
+        let edit = inner.add(
+            egui::TextEdit::multiline(&mut cx.state.settings.mpv_options)
+                .frame(egui::Frame::NONE)
+                .desired_width(box_rect.width() - 28.0)
+                .desired_rows(5)
+                .font(theme::regular(size::BODY_SM))
+                .hint_text(egui::RichText::new("name=value").color(t.text_muted)),
+        );
+        changed |= edit.lost_focus();
+    }
+    if changed {
+        cx.state.save_settings();
+    }
 }
 
 const LANGUAGES: [(&str, &str); 14] = [

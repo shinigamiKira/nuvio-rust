@@ -42,8 +42,10 @@ Where the start-up and memory difference comes from, none of it clever:
   answers;
 * posters are decoded off the UI thread and shrunk to the size they are drawn at (a Lanczos resize), then cached;
 * nothing repaints unless something changed, and egui's `request_repaint()` draws two frames per call, so everything that wakes the
-  window (video frames, finished downloads, animations) asks for one frame after a short delay instead; that alone took a 2160p
-  file from 36 % to 12 % of a core;
+  window (video frames, finished downloads) asks for one frame after a short delay instead; that alone took a 2160p file from 36 %
+  to 12 % of a core. Animations are the exception: a timer made their frames arrive 7, 14 or 20 ms apart on a 144 Hz display, so
+  they ask for the next frame at once and each frame starts after the compositor's last pass (`compositor.rs`), one per refresh,
+  and only while something moves;
 * NVDEC hands decoded frames to OpenGL without a copy.
 
 ## Build
@@ -82,6 +84,13 @@ Things a reader should know before changing the code:
   needs the copy-back NVDEC decoder; the result is checked and the file reopened without the filter when mpv dropped it.
 * Addon URLs and stream URLs carry the user's token. Errors never include them (`HttpError`), and everything that reaches the
   log passes through `nuvio_core::redact`.
+* The account session (`account.json` under `%APPDATA%\NuvioRust`) holds the access and refresh tokens in plain text, like the
+  addon URLs in `addons.json`. Neither `Debug` output nor an error message of `nuvio_core::account` includes a token or the
+  server key.
+* Frames wait for the desktop compositor before they start (`crates/app/src/compositor.rs`; the reason, with numbers, is in its
+  header). `NUVIO_PERF=1` also logs how evenly the frames are spaced and what a pass costs.
+* A picture is cached per size. When a card grows under the pointer or the window is resized, the size that is ready stands in
+  until the new one is decoded (`Images::get`); showing the placeholder instead is what made posters flash.
 
 ## Testing and the hooks the tests use
 
@@ -96,11 +105,15 @@ nuvio --data-dir <dir> --open <home | search:<text> | library | settings[:page] 
       --play <url or magnet>  (or the NUVIO_PLAY_URL environment variable)
       --screenshot <png> --screenshot-after <seconds>
       --mouse x,y             a pointer that keeps moving by a pixel, so hover states and the player controls show
-      --key <seconds>:<Key>   --click <seconds>:<x>,<y>   --scale <factor>   --size <w>x<h>   --fullscreen
+      --key <seconds>:<Key>   --click <seconds>:<x>,<y>   --type <seconds>:<text>   --scale <factor>   --size <w>x<h>   --fullscreen
 ```
 
 `NUVIO_LOG` takes a log filter, `NUVIO_MPV_LOG=v` turns on mpv's own log, `NUVIO_PERF=1` logs the frames drawn per second,
 `NUVIO_MPV_HWDEC` forces a decoder, and `NUVIO_TEST_ADDON_URL` adds an addon for that run only (it is never written to disk).
+With `--play`, `NUVIO_TEST_TITLE`, `NUVIO_TEST_BACKGROUND` and `NUVIO_TEST_LOGO` give the player a name, artwork and wordmark (to
+look at the screen shown while a stream opens), and `NUVIO_TEST_SUBTITLES=<n>` puts n addon subtitles in the Subtitles menu.
+`cargo test -p nuvio-core --test account -- --ignored` runs the one test that talks to the real account server (it signs in with an
+address that does not exist).
 
 ## Licenses
 

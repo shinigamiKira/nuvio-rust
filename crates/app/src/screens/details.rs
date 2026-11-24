@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Rect, ScrollArea, Sense, Ui, pos2, vec2};
 use nuvio_core::meta::{MetaDetails, Video};
+use nuvio_core::store::{NextEpisode, Progress, unix_seconds};
 
 use super::{Action, Cx};
 use crate::icons;
@@ -181,7 +182,7 @@ fn play_target(cx: &Cx, meta: &MetaDetails) -> PlayTarget {
             None => PlayTarget { label: "Play".into(), video: None },
         };
     }
-    let ordered: Vec<&Video> = meta.seasons().into_iter().filter(|s| *s > 0).flat_map(|s| meta.episodes_of(s)).collect();
+    let ordered = watch_order(meta);
     let resumable = ordered.iter().rev().find(|v| cx.state.progress.get(&v.id).is_some_and(|p| p.is_resumable()));
     if let Some(video) = resumable {
         return PlayTarget { label: format!("Resume {}", video.code().unwrap_or_default()), video: Some((*video).clone()) };
@@ -278,9 +279,76 @@ fn episodes(cx: &mut Cx, ui: &mut Ui, meta: &MetaDetails, season: Option<i64>, p
             if response.clicked() {
                 cx.actions.push(Action::OpenStreams { video: Some(video.clone()) });
             }
+            ui_kit::glass_popup(egui::Popup::context_menu(&response), |ui| {
+                ui.set_min_width(250.0);
+                episode_menu(cx, ui, meta, video);
+            });
         });
         ui.add_space(8.0);
     }
+}
+
+/// The episodes of a series in the order they are watched: real seasons first to last, the specials left out.
+fn watch_order(meta: &MetaDetails) -> Vec<&Video> {
+    meta.seasons().into_iter().filter(|s| *s > 0).flat_map(|s| meta.episodes_of(s)).collect()
+}
+
+/// What a right click on an episode offers.
+fn episode_menu(cx: &mut Cx, ui: &mut Ui, meta: &MetaDetails, video: &Video) {
+    let order = watch_order(meta);
+    let position = order.iter().position(|v| v.id == video.id);
+    let watched = cx.state.progress.is_watched(&video.id);
+    let unwatched_before: Vec<&Video> = position.map(|p| order[..p].iter().copied().filter(|v| !cx.state.progress.is_watched(&v.id)).collect()).unwrap_or_default();
+    let title = format!("{}{}", video.code().map(|c| format!("{c}  ")).unwrap_or_default(), video.title);
+    let heading = ui_kit::galley(ui, &title, theme::bold(size::BODY_SM), theme::get().text_muted, 250.0, 1);
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width().max(250.0), heading.size().y + 12.0), Sense::hover());
+    ui.painter().galley(row.min + vec2(14.0, 4.0), heading, theme::get().text_muted);
+
+    if ui_kit::menu_item(ui, Some(icons::PLAY), "Play", false).clicked() {
+        cx.actions.push(Action::OpenStreams { video: Some(video.clone()) });
+    }
+    if watched {
+        if ui_kit::menu_item(ui, Some(icons::VISIBILITY_OFF), "Mark as not watched", false).clicked() {
+            cx.state.progress.remove(&video.id);
+            cx.state.save_progress();
+        }
+    } else if ui_kit::menu_item(ui, Some(icons::DONE_ALL), "Mark as watched", false).clicked() {
+        mark_watched(cx, meta, &order, &[video]);
+    }
+    if !unwatched_before.is_empty() && ui_kit::menu_item(ui, Some(icons::TASK_ALT), "Mark the episodes before it as watched", false).clicked() {
+        mark_watched(cx, meta, &order, &unwatched_before);
+    }
+}
+
+/// Records `videos` as watched to the end. Their times are a second apart in the order given, so the last is the newest
+/// and Continue Watching offers the episode after it.
+fn mark_watched(cx: &mut Cx, meta: &MetaDetails, order: &[&Video], videos: &[&Video]) {
+    let now = unix_seconds();
+    for (i, video) in videos.iter().enumerate() {
+        let duration = video.runtime_minutes.map(|m| m as f64 * 60.0).filter(|d| *d > 0.0).unwrap_or(45.0 * 60.0);
+        let next = order.iter().position(|v| v.id == video.id).and_then(|p| order.get(p + 1)).map(|v| NextEpisode {
+            video_id: v.id.clone(),
+            season: v.season,
+            episode: v.episode,
+            title: Some(v.title.clone()).filter(|t| !t.is_empty()),
+        });
+        cx.state.progress.record(Progress {
+            kind: meta.kind.clone(),
+            id: meta.id.clone(),
+            video_id: video.id.clone(),
+            season: video.season,
+            episode: video.episode,
+            episode_title: Some(video.title.clone()).filter(|t| !t.is_empty()),
+            name: meta.name.clone(),
+            poster: meta.poster.clone(),
+            background: meta.background.clone(),
+            position: duration,
+            duration,
+            updated_at: now.saturating_sub((videos.len() - 1 - i) as u64),
+            next,
+        });
+    }
+    cx.state.save_progress();
 }
 
 /// `2024-03-09T00:00:00.000Z` as `Mar 9, 2024`.

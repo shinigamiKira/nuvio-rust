@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Rect, ScrollArea, Sense, Ui, pos2, vec2};
 use nuvio_core::meta::{MetaPreview, PosterShape};
-use nuvio_core::store::Progress;
+use nuvio_core::store::ContinueItem;
 
 use super::{Action, Cx};
 use crate::images::Image;
@@ -31,7 +31,7 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
         }
 
         import_offer(cx, ui, pad);
-        let resume: Vec<Progress> = cx.state.progress.continue_watching().into_iter().take(12).cloned().collect();
+        let resume: Vec<ContinueItem> = cx.state.progress.continue_watching().into_iter().take(12).collect();
         if !resume.is_empty() {
             continue_watching(cx, ui, &resume, pad);
             ui.add_space(28.0);
@@ -98,7 +98,9 @@ fn hero_items(cx: &Cx) -> Vec<MetaPreview> {
 fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
     let t = theme::get();
     let width = ui.available_width();
-    let height = (width * 0.42).clamp(380.0, 520.0);
+    // The banner is the picture, nearly as tall as the window: the backdrops are 16:9, and a short strip of one cuts the
+    // people out of it. The first shelf's title peeks out under it.
+    let height = (ui.ctx().content_rect().height() * 0.86).min(width * 9.0 / 16.0).max(380.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     let view = &mut *cx.view;
     if view.hero_index >= items.len() {
@@ -120,20 +122,31 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
         ui.ctx().request_repaint_after(remaining + Duration::from_millis(30));
     }
     let item = &items[view.hero_index];
+    // The next backdrop and wordmark are fetched ahead, so the crossfade never starts from a blank placeholder.
+    if items.len() > 1 {
+        let next = &items[(view.hero_index + 1) % items.len()];
+        let ppp = ui.ctx().pixels_per_point();
+        if let Some(url) = next.background.as_deref() {
+            cx.svc.images.prefetch(url, rect.width() * ppp);
+        }
+        if let Some(url) = next.logo.as_deref() {
+            cx.svc.images.prefetch(url, 560.0 * ppp);
+        }
+    }
 
     let bottom = CornerRadius { nw: 0, ne: 0, sw: 28, se: 28 };
-    // For a moment after a switch the old backdrop stays and the new one fades in over it.
+    // For a moment after a switch the old backdrop stays and the new one fades in over it. Backdrops are shown whole: one that
+    // is not as wide as the banner sits against its right edge with the rest filled in, nothing is cropped away.
     let fade = (view.hero_since.elapsed().as_secs_f32() / HERO_FADE).min(1.0);
     let crossfading = fade < 1.0 && view.hero_prev != view.hero_index;
-    let backdrop = |url: Option<&str>| url.map(|url| cx.svc.images.get(url, rect.width() * ui.ctx().pixels_per_point()));
     if crossfading {
-        if let Some(previous) = backdrop(items[view.hero_prev].background.as_deref()) {
-            ui_kit::paint_cover_alpha(ui, rect, &previous, bottom, 1.0);
+        if let Some(url) = items[view.hero_prev].background.as_deref() {
+            ui_kit::paint_backdrop_whole(ui, &cx.svc.images, url, rect, bottom, 1.0);
         }
         crate::services::animate_on(ui.ctx());
     }
-    match backdrop(item.background.as_deref()) {
-        Some(current) => ui_kit::paint_cover_alpha(ui, rect, &current, bottom, if crossfading { fade } else { 1.0 }),
+    match item.background.as_deref() {
+        Some(url) => ui_kit::paint_backdrop_whole(ui, &cx.svc.images, url, rect, bottom, if crossfading { fade } else { 1.0 }),
         None => {
             ui.painter().rect_filled(rect, bottom, t.card);
         }
@@ -141,7 +154,7 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
 
     // Legibility: a dark wash from the left, and the page colour rising from the bottom.
     ui_kit::horizontal_gradient(ui, Rect::from_min_max(rect.min, pos2(rect.left() + rect.width() * 0.62, rect.bottom())), Color32::from_black_alpha(190), Color32::from_black_alpha(0));
-    ui_kit::vertical_gradient(ui, Rect::from_min_max(pos2(rect.left(), rect.bottom() - 200.0), rect.max), Color32::from_black_alpha(0), with_alpha(t.background, 1.0));
+    ui_kit::vertical_gradient(ui, Rect::from_min_max(pos2(rect.left(), rect.bottom() - 260.0), rect.max), Color32::from_black_alpha(0), with_alpha(t.background, 1.0));
 
     let pad = page_padding(width);
     let text_w = (width * 0.5).min(620.0);
@@ -219,6 +232,8 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
             let logo_rect = Rect::from_min_size(pos2(rect.left() + pad, y - size.y), size);
             egui::Image::new((texture.id(), size)).tint(Color32::from_white_alpha((alpha * 255.0) as u8)).paint_at(ui, logo_rect);
         }
+        // The wordmark is on its way: showing the name until it arrives would swap text for picture in front of the viewer.
+        Some(Image::Loading) => {}
         _ => {
             let g = ui_kit::galley(ui, &item.name, theme::bold(size::PAGE_DISPLAY + 6.0), Color32::WHITE, text_w, 2);
             y -= g.size().y;
@@ -230,7 +245,7 @@ fn hero(cx: &mut Cx, ui: &mut Ui, items: &[MetaPreview]) {
     }
 }
 
-fn continue_watching(cx: &mut Cx, ui: &mut Ui, entries: &[Progress], pad: f32) {
+fn continue_watching(cx: &mut Cx, ui: &mut Ui, entries: &[ContinueItem], pad: f32) {
     let t = theme::get();
     ui.horizontal(|ui| {
         ui.add_space(pad);
@@ -243,34 +258,37 @@ fn continue_watching(cx: &mut Cx, ui: &mut Ui, entries: &[Progress], pad: f32) {
         ui.horizontal(|ui| {
             ui.add_space(pad);
             for entry in entries {
+                let progress = &entry.progress;
                 let (rect, response) = ui.allocate_exact_size(vec2(card_w, card_h + 54.0), Sense::click());
                 let hover = animate(ui, response.id.with("hover"), response.hovered(), theme::motion::NORMAL);
                 let art = Rect::from_min_size(rect.min, vec2(card_w, card_h));
                 let grown = art.expand2(art.size() * 0.02 * hover);
-                ui_kit::paint_cover_url(ui, &cx.svc.images, entry.background.as_deref().or(entry.poster.as_deref()), grown, radius::POSTER);
+                ui_kit::paint_cover_url_sized(ui, &cx.svc.images, progress.background.as_deref().or(progress.poster.as_deref()), grown, card_w, radius_of(radius::POSTER));
                 ui_kit::vertical_gradient(ui, Rect::from_min_max(pos2(grown.left(), grown.bottom() - 70.0), grown.max), Color32::from_black_alpha(0), Color32::from_black_alpha(190));
                 if hover > 0.0 {
                     ui.painter().rect_stroke(grown, radius_of(radius::POSTER), egui::Stroke::new(2.0, with_alpha(t.accent, hover)), egui::StrokeKind::Inside);
                 }
-                // Progress bar along the bottom edge.
-                let bar = Rect::from_min_size(pos2(grown.left() + 10.0, grown.bottom() - 12.0), vec2(grown.width() - 20.0, 4.0));
-                ui.painter().rect_filled(bar, radius_of(2.0), with_alpha(Color32::WHITE, 0.25));
-                ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * entry.fraction() as f32, 4.0)), radius_of(2.0), t.accent);
-                // "21m left" badge.
-                let badge = format!("{}m left", entry.remaining_minutes());
+                // Progress bar along the bottom edge; an episode that is still to start has none.
+                if entry.up_next.is_none() {
+                    let bar = Rect::from_min_size(pos2(grown.left() + 10.0, grown.bottom() - 12.0), vec2(grown.width() - 20.0, 4.0));
+                    ui.painter().rect_filled(bar, radius_of(2.0), with_alpha(Color32::WHITE, 0.25));
+                    ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * progress.fraction() as f32, 4.0)), radius_of(2.0), t.accent);
+                }
+                // "21m left" badge, or "Up next" when the episode before it was watched to the end.
+                let badge = if entry.up_next.is_some() { "Up next".to_owned() } else { format!("{}m left", progress.remaining_minutes()) };
                 let g = ui_kit::galley(ui, &badge, theme::semibold(size::LABEL_XS), Color32::WHITE, 120.0, 1);
                 let badge_rect = Rect::from_min_size(pos2(grown.right() - g.size().x - 22.0, grown.top() + 8.0), g.size() + vec2(14.0, 8.0));
-                ui.painter().rect_filled(badge_rect, radius_of(8.0), Color32::from_black_alpha(170));
-                ui.painter().galley(badge_rect.min + vec2(7.0, 4.0), g, Color32::WHITE);
+                ui.painter().rect_filled(badge_rect, radius_of(8.0), if entry.up_next.is_some() { t.accent } else { Color32::from_black_alpha(170) });
+                ui.painter().galley(badge_rect.min + vec2(7.0, 4.0), g, if entry.up_next.is_some() { t.on_accent } else { Color32::WHITE });
 
-                let label = match (entry.season, entry.episode) {
+                let label = match (entry.season(), entry.episode()) {
                     (Some(s), Some(e)) => format!("S{s} E{e}"),
                     _ => "Movie".to_owned(),
                 };
                 ui_kit::draw_text(ui, pos2(rect.left() + 12.0, art.bottom() - 30.0), Align2::LEFT_CENTER, &label, theme::semibold(size::LABEL_SM), Color32::WHITE);
-                let title = ui_kit::galley(ui, &entry.name, theme::semibold(size::BODY_MD), t.text, card_w, 1);
+                let title = ui_kit::galley(ui, &progress.name, theme::semibold(size::BODY_MD), t.text, card_w, 1);
                 ui.painter().galley(pos2(rect.left(), art.bottom() + 10.0), title, t.text);
-                if let Some(episode) = entry.episode_title.as_deref() {
+                if let Some(episode) = entry.episode_title() {
                     let sub = ui_kit::galley(ui, episode, theme::regular(size::LABEL_SM), t.text_muted, card_w, 1);
                     ui.painter().galley(pos2(rect.left(), art.bottom() + 30.0), sub, t.text_muted);
                 }
@@ -278,8 +296,9 @@ fn continue_watching(cx: &mut Cx, ui: &mut Ui, entries: &[Progress], pad: f32) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 if response.clicked() {
-                    cx.actions.push(Action::Resume(entry.video_id.clone()));
+                    cx.actions.push(Action::Resume(Box::new(entry.clone())));
                 }
+                super::context::title_menu(cx.state, cx.actions, &response, &super::context::preview_of(entry));
                 ui.add_space(14.0);
             }
             ui.add_space(pad);
@@ -294,15 +313,17 @@ fn shelf(cx: &mut Cx, ui: &mut Ui, index: usize, pad: f32) {
         let s = &cx.state.sections[index];
         (s.title.clone(), s.subtitle.clone(), s.key.clone(), s.state.clone(), s.items.len(), s.has_more, s.loading_more)
     };
-    // Portrait posters get wider with the window, within a range that keeps the title readable.
-    let card_w = (width / 8.4).clamp(150.0, 210.0);
+    // Portrait posters get wider with the window, within a range that keeps the title readable. Whole points, in steps of
+    // two: the pictures are prepared at the exact width they are drawn at, and resizing the window should not mean
+    // preparing every one again for each pixel.
+    let card_w = ((width / 8.4).clamp(150.0, 210.0) / 2.0).floor() * 2.0;
     let own_shape = if cx.state.sections[index].items.first().is_some_and(|i| i.shape == PosterShape::Landscape) { PosterShape::Landscape } else { PosterShape::Poster };
     let shape = match cx.state.settings.poster_style.as_str() {
         "portrait" => PosterShape::Poster,
         "landscape" => PosterShape::Landscape,
         _ => own_shape,
     };
-    let card_w = if shape == PosterShape::Landscape { card_w * 1.45 } else { card_w };
+    let card_w = if shape == PosterShape::Landscape { (card_w * 1.45).floor() } else { card_w };
     let row_h = ui_kit::card_size(shape, card_w).y + 44.0;
 
     ui.horizontal(|ui| {
@@ -328,73 +349,23 @@ fn shelf(cx: &mut Cx, ui: &mut Ui, index: usize, pad: f32) {
     }
 
     let scroll_id = egui::Id::unique(("shelf", &key));
-    let target_id = scroll_id.with("target");
-    let mut area = ScrollArea::horizontal().id_salt(scroll_id).auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-    // Arrow clicks animate the offset; everything else (drag, touchpad) is left to the scroll area.
-    let wanted: Option<f32> = ui.ctx().data(|d| d.get_temp(target_id));
-    if let Some(target) = wanted {
-        let eased = ui.ctx().animate_value_with_time(scroll_id.with("anim"), target, theme::motion::SLOW);
-        area = area.horizontal_scroll_offset(eased);
-        if (eased - target).abs() < 0.5 {
-            ui.ctx().data_mut(|d| d.remove::<f32>(target_id));
+    let view = ui_kit::paging_row(ui, scroll_id, pad, ui_kit::card_size(shape, card_w).y / 2.0, |ui| {
+        for item in cx.state.sections[index].items.iter() {
+            let response = PosterCard { images: &cx.svc.images, item, width: card_w, shape, show_title: true }.show(ui);
+            if response.clicked() {
+                cx.actions.push(Action::OpenDetails { kind: item.kind.clone(), id: item.id.clone(), preview: Some(item.clone()) });
+            }
+            super::context::title_menu(cx.state, cx.actions, &response, item);
         }
-    }
-    let output = area.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 14.0;
-            ui.add_space(pad);
-            for item in cx.state.sections[index].items.iter() {
-                let response = PosterCard { images: &cx.svc.images, item, width: card_w, shape, show_title: true }.show(ui);
-                if response.clicked() {
-                    cx.actions.push(Action::OpenDetails { kind: item.kind.clone(), id: item.id.clone(), preview: Some(item.clone()) });
-                }
-            }
-            if loading_more {
-                ui.add_space(20.0);
-                let (r, _) = ui.allocate_exact_size(vec2(40.0, row_h), Sense::hover());
-                ui_kit::spinner(ui, r.center_top() + vec2(0.0, card_w * 0.7), 14.0, t.text_muted);
-            }
-            ui.add_space(pad);
-        });
+        if loading_more {
+            ui.add_space(20.0);
+            let (r, _) = ui.allocate_exact_size(vec2(40.0, row_h), Sense::hover());
+            ui_kit::spinner(ui, r.center_top() + vec2(0.0, card_w * 0.7), 14.0, t.text_muted);
+        }
     });
-
-    let content_w = output.content_size.x;
-    let view_w = output.inner_rect.width();
-    let offset = output.state.clamped_offset().x;
     // Ask for the next page when the end is near.
-    if has_more && offset + view_w > content_w - card_w * 3.0 {
+    if has_more && view.offset + view.view_w > view.content_w - card_w * 3.0 {
         cx.state.load_more(cx.svc, &key);
-    }
-
-    // Paging arrows, shown when the pointer is over the shelf.
-    let over = ui.rect_contains_pointer(output.inner_rect);
-    let hover = animate(ui, scroll_id.with("arrows"), over, theme::motion::FAST);
-    if hover > 0.01 {
-        let page = view_w * 0.8;
-        let y = output.inner_rect.top() + ui_kit::card_size(shape, card_w).y / 2.0;
-        for (side, icon, delta) in [(0, crate::icons::CHEVRON_LEFT, -page), (1, crate::icons::CHEVRON_RIGHT, page)] {
-            let can = if side == 0 { offset > 1.0 } else { offset + view_w < content_w - 1.0 };
-            if !can {
-                continue;
-            }
-            let x = if side == 0 { output.inner_rect.left() + pad.min(30.0) } else { output.inner_rect.right() - pad.min(30.0) };
-            let button = Rect::from_center_size(pos2(x, y), vec2(44.0, 44.0));
-            let r = ui.interact(button, scroll_id.with(("arrow", side)), Sense::click());
-            let h = animate(ui, r.id.with("h"), r.hovered(), theme::motion::FAST);
-            ui.painter().circle_filled(button.center(), 22.0, Color32::from_black_alpha((150.0 + 60.0 * h) as u8).gamma_multiply(hover));
-            ui.painter().circle_stroke(button.center(), 22.0, egui::Stroke::new(1.0, with_alpha(Color32::WHITE, 0.18 * hover)));
-            ui_kit::draw_icon(ui, button.center(), icon, 26.0, with_alpha(Color32::WHITE, hover));
-            if r.clicked() {
-                let target = (offset + delta).clamp(0.0, (content_w - view_w).max(0.0));
-                ui.ctx().data_mut(|d| d.insert_temp(target_id, target));
-                // Start the animation from where the shelf is now, not from where it last stopped.
-                ui.ctx().animate_value_with_time(scroll_id.with("anim"), offset, 0.0);
-                crate::services::animate_on(ui.ctx());
-            }
-            if r.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-        }
     }
 }
 

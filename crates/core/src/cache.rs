@@ -45,13 +45,14 @@ impl DiskCache {
 
     /// Writes through a temporary file so a crash never leaves half an entry behind.
     pub fn put(&self, key: &str, bytes: &[u8]) {
-        let path = self.path_for(key);
-        let temp = path.with_extension("tmp");
-        let written = fs::File::create(&temp).and_then(|mut f| f.write_all(bytes)).and_then(|_| fs::rename(&temp, &path));
-        if let Err(error) = written {
-            tracing::debug!(%error, "cache write failed");
-            let _ = fs::remove_file(&temp);
-        }
+        write_atomically(&self.path_for(key), bytes);
+    }
+
+    /// Like `put`, for a program that opens the entry by path and reads its format from the extension (the player,
+    /// given a subtitle file). Returns the path, or `None` when the write failed.
+    pub fn put_file(&self, key: &str, extension: &str, bytes: &[u8]) -> Option<PathBuf> {
+        let path = self.path_for(key).with_extension(extension);
+        write_atomically(&path, bytes).then_some(path)
     }
 
     pub fn remove_all(&self) {
@@ -92,6 +93,16 @@ impl DiskCache {
     }
 }
 
+fn write_atomically(path: &Path, bytes: &[u8]) -> bool {
+    let temp = path.with_extension("tmp");
+    let written = fs::File::create(&temp).and_then(|mut f| f.write_all(bytes)).and_then(|_| fs::rename(&temp, path));
+    if let Err(error) = &written {
+        tracing::debug!(%error, "cache write failed");
+        let _ = fs::remove_file(&temp);
+    }
+    written.is_ok()
+}
+
 fn dir_size(dir: &Path) -> u64 {
     fs::read_dir(dir)
         .map(|entries| entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
@@ -116,6 +127,16 @@ mod tests {
         let hit = cache.get("a").unwrap();
         assert_eq!(hit.bytes, b"hello");
         assert!(hit.age < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn files_keep_their_extension_and_content() {
+        let cache = DiskCache::new(temp_dir("file"));
+        let path = cache.put_file("https://addon.test/a.srt", "srt", b"1\n").unwrap();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("srt"));
+        assert_eq!(fs::read(&path).unwrap(), b"1\n");
+        assert_eq!(cache.put_file("https://addon.test/a.srt", "srt", b"2\n"), Some(path.clone()), "the same key is the same file");
+        assert_eq!(fs::read(&path).unwrap(), b"2\n");
     }
 
     #[test]

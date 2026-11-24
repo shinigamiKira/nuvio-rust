@@ -75,6 +75,7 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
                     if response.clicked() {
                         cx.actions.push(Action::OpenDetails { kind: item.kind.clone(), id: item.id.clone(), preview: Some(item.clone()) });
                     }
+                    super::context::title_menu(cx.state, cx.actions, &response, item);
                 }
             });
             ui.add_space(10.0);

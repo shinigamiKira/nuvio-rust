@@ -1,3 +1,4 @@
+pub mod account;
 pub mod addon;
 pub mod cache;
 pub mod client;
@@ -7,5 +8,6 @@ pub mod json;
 pub mod meta;
 pub mod paths;
 pub mod redact;
+pub mod segments;
 pub mod store;
 pub mod stream;

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use eframe::egui;
+use nuvio_core::account::{AuthError, Session};
 use nuvio_core::addon::Manifest;
 use nuvio_core::client::AddonClient;
 use nuvio_core::meta::{CatalogPage, MetaDetails};
@@ -15,6 +16,13 @@ use tokio::runtime::Handle;
 use crate::images::Images;
 use crate::p2p::Engine;
 
+/// What a sign-in or sign-up the person asked for came to.
+pub enum AuthOutcome {
+    SignedIn(Session),
+    /// An account was made; its address has to be confirmed through the mailed link before it can sign in.
+    ConfirmEmail,
+}
+
 pub enum Msg {
     Manifest { url: String, result: Result<Manifest, String> },
     Catalog { key: String, result: Result<CatalogPage, String> },
@@ -23,7 +31,15 @@ pub enum Msg {
     Streams { request: u64, addon_url: String, result: Result<Vec<Stream>, String> },
     Search { request: u64, key: String, title: String, subtitle: String, result: Result<CatalogPage, String> },
     Subtitles { request: u64, entries: Vec<nuvio_core::stream::AddonSubtitle> },
+    /// A subtitle file was downloaded (its path), or could not be. `request` is the `Msg::Subtitles` request of the session.
+    SubtitleFile { request: u64, title: String, language: String, select: bool, result: Result<String, String> },
+    /// Where the intro and the credits of the session's episode are. `request` is the session's `segments_request`.
+    Segments { request: u64, segments: nuvio_core::segments::Segments },
     KotlinAddons(Vec<String>),
+    /// The answer to the sign-in form.
+    Auth { request: u64, result: Result<AuthOutcome, String> },
+    /// The session was renewed in the background, or could not be.
+    SessionRefreshed { user_id: String, result: Result<Session, AuthError> },
     /// A torrent stream is ready to play (its loopback URL), or could not be opened.
     Torrent { request: u64, result: Result<String, String> },
 }
@@ -36,10 +52,12 @@ pub fn wake(ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(12));
 }
 
-/// Keeps an animation going: asks for the next frame in 16 ms. `request_repaint()` draws two frames per request and
-/// runs as fast as the display refreshes (144 per second on this laptop), several times what a fade needs.
+/// Keeps an animation going: asks for the next frame. A timer made the frames of a fade arrive 7, 14 or 20 ms apart on a
+/// 144 Hz display, which looks like stutter. Asking for the next frame at once lets each one start when the compositor is
+/// ready for it (see `compositor.rs`), one per refresh. It costs a frame per refresh, a fifth of a millisecond of CPU each,
+/// and only while something is moving.
 pub fn animate_on(ctx: &egui::Context) {
-    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    ctx.request_repaint();
 }
 
 #[derive(Clone)]

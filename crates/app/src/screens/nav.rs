@@ -18,6 +18,38 @@ const ITEM_W: f32 = 78.0;
 const HEIGHT: f32 = 60.0;
 const PAD: f32 = 6.0;
 
+const ACCOUNT_SIZE: f32 = 52.0;
+
+/// The round account button at the top right: a person when nobody is signed in, the first letter of the address when
+/// someone is (`signed_in` is that address). Returns whether it was clicked.
+pub fn account_button(ctx: &egui::Context, signed_in: Option<&str>) -> bool {
+    let t = theme::get();
+    let mut clicked = false;
+    Area::new(Id::unique("account-button")).anchor(Align2::RIGHT_TOP, vec2(-28.0, 14.0 + (HEIGHT + PAD * 2.0 - ACCOUNT_SIZE) / 2.0)).order(Order::Foreground).show(ctx, |ui| {
+        let (rect, response) = ui.allocate_exact_size(vec2(ACCOUNT_SIZE, ACCOUNT_SIZE), Sense::click());
+        glass_panel(ui, rect, ACCOUNT_SIZE / 2.0, 1.0);
+        let hover = animate(ui, response.id.with("hover"), response.hovered(), theme::motion::FAST);
+        ui.painter().circle_filled(rect.center(), ACCOUNT_SIZE / 2.0, with_alpha(Color32::WHITE, 0.12 * hover));
+        match signed_in {
+            Some(email) => {
+                let initial = email.chars().next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_else(|| "?".into());
+                ui.painter().circle_filled(rect.center(), ACCOUNT_SIZE / 2.0 - 7.0, t.accent);
+                ui_kit::draw_text(ui, rect.center(), Align2::CENTER_CENTER, &initial, theme::bold(size::BODY_LG), t.on_accent);
+            }
+            None => ui_kit::draw_icon(ui, rect.center(), icons::PERSON, 28.0, ui_kit::lerp_color(t.text_secondary, t.text, hover)),
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tip = match signed_in {
+            Some(email) => format!("Signed in as {email}"),
+            None => "Sign in".to_owned(),
+        };
+        clicked = response.on_hover_text(tip).clicked();
+    });
+    clicked
+}
+
 /// Draws the pill and returns the tab the user clicked, if any.
 pub fn show(ctx: &egui::Context, current: Tab) -> Option<Tab> {
     let t = theme::get();

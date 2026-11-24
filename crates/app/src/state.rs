@@ -4,13 +4,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nuvio_core::account::{self, Account, AuthError, Server, Session, SignUp};
 use nuvio_core::addon::{CatalogDef, Manifest};
 use nuvio_core::client::{HOME_PREVIEW_ITEMS, StreamSource};
 use nuvio_core::meta::{MetaDetails, MetaPreview};
-use nuvio_core::store::{AddonEntry, AddonList, CINEMETA, JsonFile, Library, ProgressBook, Settings};
+use nuvio_core::store::{AddonEntry, AddonList, CINEMETA, JsonFile, Library, ProgressBook, SearchHistory, Settings, unix_seconds};
 use nuvio_core::stream::{Facet, Stream};
 
-use crate::services::{Msg, Services};
+use crate::services::{AuthOutcome, Msg, Services};
+
+/// After a renewal that could not be delivered (no network), the next try waits this long.
+const REFRESH_RETRY: Duration = Duration::from_secs(60);
 
 /// A cached shelf younger than this is shown without asking the addon again.
 const CATALOG_FRESH: Duration = Duration::from_secs(10 * 60);
@@ -129,6 +133,53 @@ pub struct SearchState {
     pub rows: Vec<SearchRow>,
     pub pending: usize,
     pub typed_at: Option<Instant>,
+    /// When the words in `submitted` were sent to the addons, and whether they are in the history already.
+    pub ran_at: Option<Instant>,
+    pub remembered: bool,
+}
+
+/// The signed-in person, and what the sign-in form is doing.
+pub struct AccountState {
+    file: JsonFile<Account>,
+    pub session: Option<Session>,
+    /// The form's request is out.
+    pub busy: bool,
+    pub error: Option<String>,
+    pub notice: Option<String>,
+    request: u64,
+    refreshing: bool,
+    retry_at: Option<Instant>,
+}
+
+impl AccountState {
+    fn load() -> Self {
+        let file = JsonFile::<Account>::new("account.json");
+        Self { session: file.load().session, file, busy: false, error: None, notice: None, request: 0, refreshing: false, retry_at: None }
+    }
+
+    fn set_session(&mut self, session: Option<Session>) {
+        self.session = session;
+        self.file.save(&Account { session: self.session.clone() });
+    }
+
+    /// When the access token needs renewing: now if it is due and no renewal is out or waiting to be retried.
+    pub fn refresh_due(&self) -> RefreshDue {
+        let Some(session) = &self.session else { return RefreshDue::Never };
+        if self.refreshing {
+            return RefreshDue::Never;
+        }
+        let now = unix_seconds();
+        if let Some(at) = self.retry_at.filter(|at| *at > Instant::now()) {
+            return RefreshDue::In(at - Instant::now());
+        }
+        if session.needs_refresh(now) { RefreshDue::Now } else { RefreshDue::In(Duration::from_secs(session.refresh_in(now) + 1)) }
+    }
+}
+
+pub enum RefreshDue {
+    Never,
+    Now,
+    In(Duration),
 }
 
 pub struct State {
@@ -143,8 +194,11 @@ pub struct State {
     pub library: Library,
     pub progress_file: JsonFile<ProgressBook>,
     pub progress: ProgressBook,
+    pub history_file: JsonFile<SearchHistory>,
+    pub history: SearchHistory,
     pub settings_file: JsonFile<Settings>,
     pub settings: Settings,
+    pub account: AccountState,
     pub next_request: u64,
     pub kotlin_addons: Vec<String>,
     catalog_inflight: usize,
@@ -163,13 +217,17 @@ impl State {
         let library_file = JsonFile::<Library>::new("library.json");
         let progress_file = JsonFile::<ProgressBook>::new("progress.json");
         let settings_file = JsonFile::<Settings>::new("settings.json");
+        let history_file = JsonFile::<SearchHistory>::new("search_history.json");
         Self {
             library: library_file.load(),
             progress: progress_file.load(),
             settings: settings_file.load(),
+            history: history_file.load(),
+            history_file,
             library_file,
             progress_file,
             settings_file,
+            account: AccountState::load(),
             addon_file,
             addons: Vec::new(),
             addon_list,
@@ -189,6 +247,57 @@ impl State {
         self.next_request
     }
 
+    /// Signs in with the address and password, or makes the account. The answer arrives as `Msg::Auth`.
+    pub fn sign_in(&mut self, svc: &Services, email: String, password: String, create: bool) {
+        if self.account.busy {
+            return;
+        }
+        self.account.busy = true;
+        self.account.error = None;
+        self.account.notice = None;
+        let request = self.request_id();
+        self.account.request = request;
+        let http = svc.client.http().clone();
+        svc.spawn(async move {
+            let result = async {
+                let server = Server::resolve(&http).await?;
+                if create {
+                    Ok(match account::sign_up(&http, &server, &email, &password).await? {
+                        SignUp::SignedIn(session) => AuthOutcome::SignedIn(session),
+                        SignUp::ConfirmEmail => AuthOutcome::ConfirmEmail,
+                    })
+                } else {
+                    account::sign_in(&http, &server, &email, &password).await.map(AuthOutcome::SignedIn)
+                }
+            }
+            .await
+            .map_err(|error: AuthError| error.to_string());
+            Msg::Auth { request, result }
+        });
+    }
+
+    /// Forgets the session here at once and tells the server in the background.
+    pub fn sign_out(&mut self, svc: &Services) {
+        self.account.error = None;
+        self.account.notice = None;
+        if let Some(session) = self.account.session.clone() {
+            self.account.set_session(None);
+            let http = svc.client.http().clone();
+            svc.runtime.spawn(async move { account::sign_out(&http, &session).await });
+        }
+    }
+
+    /// Renews the access token before it runs out. The answer arrives as `Msg::SessionRefreshed`.
+    pub fn refresh_session(&mut self, svc: &Services) {
+        let Some(session) = self.account.session.clone() else { return };
+        self.account.refreshing = true;
+        let http = svc.client.http().clone();
+        svc.spawn(async move {
+            let user_id = session.user_id.clone();
+            Msg::SessionRefreshed { user_id, result: account::refresh(&http, &session).await }
+        });
+    }
+
     pub fn save_settings(&self) {
         self.settings_file.save(&self.settings);
     }
@@ -199,6 +308,21 @@ impl State {
 
     pub fn save_progress(&self) {
         self.progress_file.save(&self.progress);
+    }
+
+    pub fn save_history(&self) {
+        self.history_file.save(&self.history);
+    }
+
+    /// Remembers what was searched for, unless it already is the latest.
+    pub fn remember_search(&mut self, query: &str) {
+        self.search.remembered = true;
+        let query = query.trim();
+        if self.history.entries.first().is_some_and(|latest| latest == query) {
+            return;
+        }
+        self.history.record(query);
+        self.save_history();
     }
 
     pub fn save_addons(&self) {
@@ -462,9 +586,12 @@ impl State {
         self.search.submitted = query.clone();
         self.search.rows.clear();
         self.search.pending = 0;
-        if query.len() < 2 {
+        self.search.ran_at = None;
+        self.search.remembered = false;
+        if query.chars().count() < 2 {
             return;
         }
+        self.search.ran_at = Some(Instant::now());
         let request = self.request_id();
         self.search.request = request;
         for addon in self.addons.iter().filter(|a| a.is_active()) {
@@ -580,8 +707,46 @@ impl State {
                     }
                 }
             }
-            Msg::Subtitles { .. } => {}
+            Msg::Subtitles { .. } | Msg::SubtitleFile { .. } | Msg::Segments { .. } => {}
             Msg::KotlinAddons(urls) => self.kotlin_addons = urls,
+            Msg::Auth { request, result } if request == self.account.request => {
+                self.account.busy = false;
+                match result {
+                    Ok(AuthOutcome::SignedIn(session)) => {
+                        self.account.set_session(Some(session));
+                        self.account.retry_at = None;
+                        self.account.error = None;
+                    }
+                    Ok(AuthOutcome::ConfirmEmail) => {
+                        self.account.notice = Some("Account created. Open the link in the email that was sent to you, then sign in.".into());
+                    }
+                    Err(error) => self.account.error = Some(error),
+                }
+            }
+            Msg::Auth { .. } => {}
+            Msg::SessionRefreshed { user_id, result } => {
+                self.account.refreshing = false;
+                // The person may have signed out, or into another account, while this was on its way.
+                if self.account.session.as_ref().is_none_or(|s| s.user_id != user_id) {
+                    return;
+                }
+                match result {
+                    Ok(session) => {
+                        // A server that hands out tokens shorter than the renewal margin must not be asked in a loop.
+                        self.account.retry_at = session.needs_refresh(unix_seconds()).then(|| Instant::now() + REFRESH_RETRY);
+                        self.account.set_session(Some(session));
+                    }
+                    Err(error) if error.ends_session() => {
+                        tracing::info!("the account session was refused, signing out");
+                        self.account.set_session(None);
+                        self.account.error = Some("Your session has ended. Sign in again.".into());
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "could not renew the session, will retry");
+                        self.account.retry_at = Some(Instant::now() + REFRESH_RETRY);
+                    }
+                }
+            }
             // Torrent streams belong to the player session, which the app owns.
             Msg::Torrent { .. } => {}
         }

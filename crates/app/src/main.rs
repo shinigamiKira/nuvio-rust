@@ -2,15 +2,19 @@
 
 mod app;
 mod args;
+mod compositor;
 mod glass;
 mod icons;
 mod images;
 mod logging;
+mod mpv_custom;
 mod p2p;
+mod platform;
 mod player;
 mod screens;
 mod services;
 mod state;
+mod subtitles;
 mod theme;
 mod ui_kit;
 mod window;
@@ -32,6 +36,7 @@ fn main() -> anyhow::Result<()> {
     logging::init();
     install_panic_hook();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Nuvio starting");
+    platform::start();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

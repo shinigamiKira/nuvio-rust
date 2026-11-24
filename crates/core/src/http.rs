@@ -61,6 +61,12 @@ impl Resolve for CachingResolver {
     }
 }
 
+/// An answer whatever its status, for servers that explain a refusal in the body.
+pub struct Reply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct Http {
     client: reqwest::Client,
@@ -90,6 +96,19 @@ impl Http {
             return Err(HttpError::Status(status.as_u16()));
         }
         response.bytes().await.map(|b| b.to_vec()).map_err(map_error)
+    }
+
+    /// POST `body` (JSON) to `url`. Unlike `get`, a 4xx or 5xx is a `Reply`, not an error: the account server says why it
+    /// said no in the body. Errors never carry the URL.
+    pub async fn post_json(&self, url: &str, headers: &[(&str, &str)], body: Vec<u8>, timeout: Duration) -> Result<Reply, HttpError> {
+        let mut request = self.client.post(url).header("Content-Type", "application/json").timeout(timeout).body(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.map_err(map_error)?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await.map(|b| b.to_vec()).map_err(map_error)?;
+        Ok(Reply { status, body })
     }
 
     /// Asks for the first byte of `url` and throws the answer away. Addons that resolve a debrid link when the stream is

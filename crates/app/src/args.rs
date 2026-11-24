@@ -31,6 +31,8 @@ pub struct Args {
     pub keys: Vec<(f64, String)>,
     /// `--click <seconds>:<x>,<y>`, repeatable: click there after a while (points, not pixels).
     pub clicks: Vec<(f64, f32, f32)>,
+    /// `--type <seconds>:<text>`, repeatable: type into the focused field after a while.
+    pub texts: Vec<(f64, String)>,
 }
 
 impl Args {
@@ -63,6 +65,12 @@ impl Args {
                     let text = value();
                     if let Some((at, key)) = text.split_once(':') {
                         args.keys.push((at.parse().unwrap_or(0.0), key.to_owned()));
+                    }
+                }
+                "--type" => {
+                    let text = value();
+                    if let Some((at, typed)) = text.split_once(':') {
+                        args.texts.push((at.parse().unwrap_or(0.0), typed.to_owned()));
                     }
                 }
                 "--click" => {
