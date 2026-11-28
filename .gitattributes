@@ -4,3 +4,4 @@
 *.ttf binary
 *.otf binary
 *.dll binary
+*.dmg binary

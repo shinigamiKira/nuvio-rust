@@ -10,6 +10,34 @@ share code with the Kotlin build; the two can be installed side by side (`%APPDA
 
 What is ported and what is not is in [PORTING.md](PORTING.md).
 
+## Install on macOS
+
+The macOS app is built from the [`macos` branch](https://github.com/shinigamiKira/nuvio-rust/tree/macos), which holds its
+source and build instructions. The source on this branch builds the Windows app only.
+
+**[Download Nuvio-Rust-0.1.0-macos-arm64.dmg](releases/Nuvio-Rust-0.1.0-macos-arm64.dmg?raw=true)** (36 MB)
+
+Needs an Apple Silicon Mac with macOS 27.0 or newer. It has been tried on one Mac only, a Mac mini with an M6. It carries
+libmpv, so nothing else has to be installed.
+
+1. Download the disk image. To check it, run this in Terminal:
+
+   ```sh
+   shasum -a 256 ~/Downloads/Nuvio-Rust-0.1.0-macos-arm64.dmg
+   ```
+
+   It should print `025542a886eac043c47138720eb4845089a7daacfc1125d7395fefd408743b5d`.
+2. Open the disk image and drag **Nuvio** to **Applications**.
+3. Open Nuvio once. The build is signed ad hoc, without an Apple developer certificate, so macOS stops it: close the warning.
+4. Open **System Settings → Privacy & Security**, scroll down and choose **Open Anyway**. Instead of this step you can run
+   `xattr -dr com.apple.quarantine /Applications/Nuvio.app` in Terminal. Either one lifts macOS's check for this app, so do it
+   only for a copy whose checksum matched.
+
+To update, replace the app in Applications. To remove it, delete the app. Settings, library and watch progress stay in
+`~/Library/Application Support/NuvioRust` until you delete that folder too.
+
+Dolby Vision profile 5 plays with wrong colours on macOS. Torrent streams, HDR and AV1 have not been tried there.
+
 ## Lighter and faster, and where it is not
 
 Measured on the machine the Kotlin port was tuned on (Windows 11, i5-11300H, RTX 3060 Laptop, 1080p display at 100 %, on mains
@@ -119,4 +147,6 @@ address that does not exist).
 
 Nuvio is GPL-3.0 and so is this port (`LICENSE`). Bundled: libmpv with FFmpeg and libass (GPL build), JetBrains Sans (OFL),
 Material Icons (Apache-2.0), and the Rust crates listed in `Cargo.lock` (egui, librqbit, reqwest, tokio and others, under MIT or
-Apache-2.0).
+Apache-2.0). The macOS app
+bundles Homebrew's builds of libmpv and its libraries; their names and versions are in `Contents/Resources/THIRD-PARTY.txt`,
+and the app's own source is on the `macos` branch.
