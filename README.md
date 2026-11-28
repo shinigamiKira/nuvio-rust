@@ -1,6 +1,6 @@
-# Nuvio for Windows, in Rust
+# Nuvio for Windows and macOS, in Rust
 
-A native Windows port of the Nuvio desktop app, written in Rust. No JVM and no web view: the interface is drawn with
+A native desktop port of the Nuvio desktop app, written in Rust. No JVM and no web view: the interface is drawn with
 [egui](https://github.com/emilk/egui) on OpenGL, and video is played by [libmpv](https://mpv.io) into the same window, so the
 player controls are ordinary widgets on top of the picture.
 
@@ -11,9 +11,6 @@ share code with the Kotlin build; the two can be installed side by side (`%APPDA
 What is ported and what is not is in [PORTING.md](PORTING.md).
 
 ## Install on macOS
-
-The macOS app is built from the [`macos` branch](https://github.com/shinigamiKira/nuvio-rust/tree/macos), which holds its
-source and build instructions. The source on this branch builds the Windows app only.
 
 **[Download Nuvio-Rust-0.1.0-macos-arm64.dmg](releases/Nuvio-Rust-0.1.0-macos-arm64.dmg?raw=true)** (36 MB)
 
@@ -91,14 +88,44 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 # dist\Nuvi
 The repository sits in a OneDrive folder on the machine it was written on, so `target` is redirected with a per-user
 `~/.cargo/config.toml` (`[build] target-dir = "C:/nuvio-build/cargo-target"`). Keep build output out of synced folders.
 
+## macOS (Apple Silicon)
+
+Needs a Rust toolchain, the Xcode command line tools and libmpv from Homebrew.
+
+```sh
+brew install mpv
+cargo run -p nuvio --profile fast                      # uses Homebrew's libmpv
+NUVIO_REQUIRE_LIBMPV=1 cargo test --workspace          # fail, instead of skip, without libmpv
+scripts/build-macos.sh                                 # dist/Nuvio.app and dist/Nuvio-Rust-<version>-macos-arm64.dmg
+```
+
+The packaged app carries libmpv and its libraries, so it runs without Homebrew. It asks for the macOS version of the Mac
+that built it (Homebrew's libraries are made for that one) or newer.
+
+It is signed ad hoc, without an Apple developer certificate; see [Install on macOS](#install-on-macos) for the first start.
+The script keeps your home folder's path out of the binary.
+
+| | |
+| --- | --- |
+| Settings, library, watch progress | `~/Library/Application Support/NuvioRust` |
+| Caches | `~/Library/Caches/NuvioRust` |
+| Log | `~/Library/Logs/NuvioRust/nuvio.log` |
+| Full screen | `⌃⌘F` (in the player also `F`) |
+| Back | `⌘[`, `Delete`, `Esc` |
+| Search, settings, refresh Home | `⌘K` or `⌘F`, `⌘,`, `⌘R` |
+| Close, minimize, quit | `⌘W`, `⌘M`, `⌘Q` |
+
+Dolby Vision profile 5 plays with wrong colours because Homebrew's FFmpeg has no `libplacebo` filter.
+
 ## Layout
 
 ```
 crates/core   addon protocol (manifests, catalogs, meta, streams, subtitles), the HTTP client, the stores, facet filtering
 crates/mpv    libmpv loaded at run time, events, and an OpenGL render context
-crates/app    the egui application: screens, player, torrent engine, the glass blur, the installer resources
+crates/app    the egui application: screens, player, torrent engine, the glass blur, the installer resources;
+              `src/platform` holds what differs between Windows and macOS
 installer     Inno Setup script
-scripts       fetch-libmpv.ps1, build-installer.ps1
+scripts       fetch-libmpv.ps1, build-installer.ps1 (Windows); build-macos.sh, bundle-dylibs.py (macOS)
 assets        JetBrains Sans and the Material Icons font
 ```
 
@@ -115,7 +142,7 @@ Things a reader should know before changing the code:
 * The account session (`account.json` under `%APPDATA%\NuvioRust`) holds the access and refresh tokens in plain text, like the
   addon URLs in `addons.json`. Neither `Debug` output nor an error message of `nuvio_core::account` includes a token or the
   server key.
-* Frames wait for the desktop compositor before they start (`crates/app/src/compositor.rs`; the reason, with numbers, is in its
+* Frames wait for the desktop compositor before they start (`crates/app/src/platform/compositor.rs`, Windows only; the reason, with numbers, is in its
   header). `NUVIO_PERF=1` also logs how evenly the frames are spaced and what a pass costs.
 * A picture is cached per size. When a card grows under the pointer or the window is resized, the size that is ready stands in
   until the new one is decoded (`Images::get`); showing the placeholder instead is what made posters flash.
@@ -133,7 +160,7 @@ nuvio --data-dir <dir> --open <home | search:<text> | library | settings[:page] 
       --play <url or magnet>  (or the NUVIO_PLAY_URL environment variable)
       --screenshot <png> --screenshot-after <seconds>
       --mouse x,y             a pointer that keeps moving by a pixel, so hover states and the player controls show
-      --key <seconds>:<Key>   --click <seconds>:<x>,<y>   --type <seconds>:<text>   --scale <factor>   --size <w>x<h>   --fullscreen
+      --key <seconds>:[cmd+|ctrl+|alt+|shift+]<Key>   --click <seconds>:<x>,<y>   --type <seconds>:<text>   --scale <factor>   --size <w>x<h>   --fullscreen
 ```
 
 `NUVIO_LOG` takes a log filter, `NUVIO_MPV_LOG=v` turns on mpv's own log, `NUVIO_PERF=1` logs the frames drawn per second,
@@ -148,5 +175,4 @@ address that does not exist).
 Nuvio is GPL-3.0 and so is this port (`LICENSE`). Bundled: libmpv with FFmpeg and libass (GPL build), JetBrains Sans (OFL),
 Material Icons (Apache-2.0), and the Rust crates listed in `Cargo.lock` (egui, librqbit, reqwest, tokio and others, under MIT or
 Apache-2.0). The macOS app
-bundles Homebrew's builds of libmpv and its libraries; their names and versions are in `Contents/Resources/THIRD-PARTY.txt`,
-and the app's own source is on the `macos` branch.
+bundles Homebrew's builds of libmpv and its libraries; their names and versions are in `Contents/Resources/THIRD-PARTY.txt`.

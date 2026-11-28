@@ -254,55 +254,50 @@ fn continue_watching(cx: &mut Cx, ui: &mut Ui, entries: &[ContinueItem], pad: f3
     ui.add_space(10.0);
     let card_w = 300.0;
     let card_h = card_w / 1.77;
-    ScrollArea::horizontal().id_salt("cw-scroll").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(pad);
-            for entry in entries {
-                let progress = &entry.progress;
-                let (rect, response) = ui.allocate_exact_size(vec2(card_w, card_h + 54.0), Sense::click());
-                let hover = animate(ui, response.id.with("hover"), response.hovered(), theme::motion::NORMAL);
-                let art = Rect::from_min_size(rect.min, vec2(card_w, card_h));
-                let grown = art.expand2(art.size() * 0.02 * hover);
-                ui_kit::paint_cover_url_sized(ui, &cx.svc.images, progress.background.as_deref().or(progress.poster.as_deref()), grown, card_w, radius_of(radius::POSTER));
-                ui_kit::vertical_gradient(ui, Rect::from_min_max(pos2(grown.left(), grown.bottom() - 70.0), grown.max), Color32::from_black_alpha(0), Color32::from_black_alpha(190));
-                if hover > 0.0 {
-                    ui.painter().rect_stroke(grown, radius_of(radius::POSTER), egui::Stroke::new(2.0, with_alpha(t.accent, hover)), egui::StrokeKind::Inside);
-                }
-                // Progress bar along the bottom edge; an episode that is still to start has none.
-                if entry.up_next.is_none() {
-                    let bar = Rect::from_min_size(pos2(grown.left() + 10.0, grown.bottom() - 12.0), vec2(grown.width() - 20.0, 4.0));
-                    ui.painter().rect_filled(bar, radius_of(2.0), with_alpha(Color32::WHITE, 0.25));
-                    ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * progress.fraction() as f32, 4.0)), radius_of(2.0), t.accent);
-                }
-                // "21m left" badge, or "Up next" when the episode before it was watched to the end.
-                let badge = if entry.up_next.is_some() { "Up next".to_owned() } else { format!("{}m left", progress.remaining_minutes()) };
-                let g = ui_kit::galley(ui, &badge, theme::semibold(size::LABEL_XS), Color32::WHITE, 120.0, 1);
-                let badge_rect = Rect::from_min_size(pos2(grown.right() - g.size().x - 22.0, grown.top() + 8.0), g.size() + vec2(14.0, 8.0));
-                ui.painter().rect_filled(badge_rect, radius_of(8.0), if entry.up_next.is_some() { t.accent } else { Color32::from_black_alpha(170) });
-                ui.painter().galley(badge_rect.min + vec2(7.0, 4.0), g, if entry.up_next.is_some() { t.on_accent } else { Color32::WHITE });
-
-                let label = match (entry.season(), entry.episode()) {
-                    (Some(s), Some(e)) => format!("S{s} E{e}"),
-                    _ => "Movie".to_owned(),
-                };
-                ui_kit::draw_text(ui, pos2(rect.left() + 12.0, art.bottom() - 30.0), Align2::LEFT_CENTER, &label, theme::semibold(size::LABEL_SM), Color32::WHITE);
-                let title = ui_kit::galley(ui, &progress.name, theme::semibold(size::BODY_MD), t.text, card_w, 1);
-                ui.painter().galley(pos2(rect.left(), art.bottom() + 10.0), title, t.text);
-                if let Some(episode) = entry.episode_title() {
-                    let sub = ui_kit::galley(ui, episode, theme::regular(size::LABEL_SM), t.text_muted, card_w, 1);
-                    ui.painter().galley(pos2(rect.left(), art.bottom() + 30.0), sub, t.text_muted);
-                }
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if response.clicked() {
-                    cx.actions.push(Action::Resume(Box::new(entry.clone())));
-                }
-                super::context::title_menu(cx.state, cx.actions, &response, &super::context::preview_of(entry));
-                ui.add_space(14.0);
+    ui_kit::paging_row(ui, egui::Id::unique("cw-scroll"), pad, card_h / 2.0, |ui| {
+        for entry in entries {
+            let progress = &entry.progress;
+            let (rect, response) = ui.allocate_exact_size(vec2(card_w, card_h + 54.0), Sense::click());
+            let hover = animate(ui, response.id.with("hover"), response.hovered(), theme::motion::NORMAL);
+            let art = Rect::from_min_size(rect.min, vec2(card_w, card_h));
+            let grown = art.expand2(art.size() * 0.02 * hover);
+            ui_kit::paint_cover_url_sized(ui, &cx.svc.images, progress.background.as_deref().or(progress.poster.as_deref()), grown, card_w, radius_of(radius::POSTER));
+            ui_kit::vertical_gradient(ui, Rect::from_min_max(pos2(grown.left(), grown.bottom() - 70.0), grown.max), Color32::from_black_alpha(0), Color32::from_black_alpha(190));
+            if hover > 0.0 {
+                ui.painter().rect_stroke(grown, radius_of(radius::POSTER), egui::Stroke::new(2.0, with_alpha(t.accent, hover)), egui::StrokeKind::Inside);
             }
-            ui.add_space(pad);
-        });
+            // Progress bar along the bottom edge; an episode that is still to start has none.
+            if entry.up_next.is_none() {
+                let bar = Rect::from_min_size(pos2(grown.left() + 10.0, grown.bottom() - 12.0), vec2(grown.width() - 20.0, 4.0));
+                ui.painter().rect_filled(bar, radius_of(2.0), with_alpha(Color32::WHITE, 0.25));
+                ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * progress.fraction() as f32, 4.0)), radius_of(2.0), t.accent);
+            }
+            // "21m left" badge, or "Up next" when the episode before it was watched to the end.
+            let badge = if entry.up_next.is_some() { "Up next".to_owned() } else { format!("{}m left", progress.remaining_minutes()) };
+            let g = ui_kit::galley(ui, &badge, theme::semibold(size::LABEL_XS), Color32::WHITE, 120.0, 1);
+            let badge_rect = Rect::from_min_size(pos2(grown.right() - g.size().x - 22.0, grown.top() + 8.0), g.size() + vec2(14.0, 8.0));
+            ui.painter().rect_filled(badge_rect, radius_of(8.0), if entry.up_next.is_some() { t.accent } else { Color32::from_black_alpha(170) });
+            ui.painter().galley(badge_rect.min + vec2(7.0, 4.0), g, if entry.up_next.is_some() { t.on_accent } else { Color32::WHITE });
+
+            let label = match (entry.season(), entry.episode()) {
+                (Some(s), Some(e)) => format!("S{s} E{e}"),
+                _ => "Movie".to_owned(),
+            };
+            ui_kit::draw_text(ui, pos2(rect.left() + 12.0, art.bottom() - 30.0), Align2::LEFT_CENTER, &label, theme::semibold(size::LABEL_SM), Color32::WHITE);
+            let title = ui_kit::galley(ui, &progress.name, theme::semibold(size::BODY_MD), t.text, card_w, 1);
+            ui.painter().galley(pos2(rect.left(), art.bottom() + 10.0), title, t.text);
+            if let Some(episode) = entry.episode_title() {
+                let sub = ui_kit::galley(ui, episode, theme::regular(size::LABEL_SM), t.text_muted, card_w, 1);
+                ui.painter().galley(pos2(rect.left(), art.bottom() + 30.0), sub, t.text_muted);
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                cx.actions.push(Action::Resume(Box::new(entry.clone())));
+            }
+            super::context::title_menu(cx.state, cx.actions, &response, &super::context::preview_of(entry));
+        }
     });
 }
 

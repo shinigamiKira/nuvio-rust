@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use eframe::egui::{Key, Modifiers};
+
 #[derive(Debug, Default, Clone)]
 pub struct Args {
     /// `--play <url>`: open the player on a URL right away.
@@ -27,7 +29,8 @@ pub struct Args {
     pub mouse: Option<(f32, f32)>,
     /// `--select <n>`: with `--open streams:...`, play the n-th stream of the list.
     pub select: Option<usize>,
-    /// `--key <seconds>:<Key>`, repeatable: press a key (egui names: `Space`, `ArrowUp`, `F`) after a while.
+    /// `--key <seconds>:<Key>`, repeatable: press a key (egui names: `Space`, `ArrowUp`, `F`, with `cmd+`, `ctrl+`,
+    /// `alt+` or `shift+` in front) after a while.
     pub keys: Vec<(f64, String)>,
     /// `--click <seconds>:<x>,<y>`, repeatable: click there after a while (points, not pixels).
     pub clicks: Vec<(f64, f32, f32)>,
@@ -85,5 +88,37 @@ impl Args {
             }
         }
         args
+    }
+}
+
+/// `cmd+ctrl+F` as the modifiers and the key. `cmd` is the Command key of a Mac.
+pub fn parse_chord(chord: &str) -> Option<(Modifiers, Key)> {
+    let mut parts: Vec<&str> = chord.split('+').collect();
+    let key = Key::from_name(parts.pop()?)?;
+    let mut modifiers = Modifiers::NONE;
+    for part in parts {
+        match part {
+            "cmd" => (modifiers.mac_cmd, modifiers.command) = (true, true),
+            "ctrl" => modifiers.ctrl = true,
+            "alt" => modifiers.alt = true,
+            "shift" => modifiers.shift = true,
+            _ => return None,
+        }
+    }
+    Some((modifiers, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chord_names_its_modifiers_and_key() {
+        assert_eq!(parse_chord("Space"), Some((Modifiers::NONE, Key::Space)));
+        let (modifiers, key) = parse_chord("cmd+ctrl+F").unwrap();
+        assert!(modifiers.mac_cmd && modifiers.command && modifiers.ctrl && !modifiers.alt);
+        assert_eq!(key, Key::F);
+        assert_eq!(parse_chord("hyper+F"), None);
+        assert_eq!(parse_chord("cmd+"), None);
     }
 }

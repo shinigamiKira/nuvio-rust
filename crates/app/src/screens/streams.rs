@@ -211,17 +211,21 @@ fn filters(cx: &mut Cx, ui: &mut Ui) {
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
+            // An addon can name dozens of languages: the list stays inside the window and scrolls.
+            let room = (ui.ctx().content_rect().bottom() - response.rect.bottom() - 32.0).clamp(160.0, 520.0);
             Popup::menu(&response).gap(6.0).show(|ui| {
                 ui.set_min_width(200.0);
-                if option_row(ui, "All", None, selected.is_none()).clicked() {
-                    change = Some((facet, None));
-                }
-                for option in &options {
-                    let label = if facet == Facet::Hdr && option.value == DOLBY_VISION { "Dolby Vision".to_owned() } else { option.value.clone() };
-                    if option_row(ui, &label, Some(option.count), selected.as_deref() == Some(option.value.as_str())).clicked() {
-                        change = Some((facet, Some(option.value.clone())));
+                ScrollArea::vertical().max_height(room).show(ui, |ui| {
+                    if option_row(ui, "All", None, selected.is_none()).clicked() {
+                        change = Some((facet, None));
                     }
-                }
+                    for option in &options {
+                        let label = if facet == Facet::Hdr && option.value == DOLBY_VISION { "Dolby Vision".to_owned() } else { option.value.clone() };
+                        if option_row(ui, &label, Some(option.count), selected.as_deref() == Some(option.value.as_str())).clicked() {
+                            change = Some((facet, Some(option.value.clone())));
+                        }
+                    }
+                });
             });
         }
         if !selection.is_empty() && ui_kit::chip(ui, "Clear filters", false).clicked() {

@@ -1,4 +1,4 @@
-//! Custom mpv: the scripts, key bindings and options a person keeps in `%APPDATA%\NuvioRust\mpv`.
+//! Custom mpv: the scripts, key bindings and options a person keeps in the `mpv` folder of Nuvio's data folder.
 //!
 //! The folder holds what mpv's own configuration folder would:
 //!
@@ -60,12 +60,15 @@ pub fn scripts() -> Vec<PathBuf> {
             if path.is_dir() {
                 return path.join("main.lua").exists() || path.join("main.js").exists();
             }
-            matches!(path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(), Some("lua" | "js" | "so" | "dll"))
+            matches!(path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(), Some("lua" | "js" | "so" | "dll" | "dylib"))
         })
         .collect();
     found.sort();
     found
 }
+
+/// The separator of mpv's path lists.
+const PATH_LIST_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
 
 /// What the player is given besides its own options. Cheap to clone: the player screen takes a copy every frame.
 #[derive(Default, Clone)]
@@ -85,8 +88,7 @@ impl Custom {
         let mut options: Vec<(String, String)> = Vec::new();
         let scripts: Vec<String> = scripts().iter().map(|p| p.display().to_string()).collect();
         if !scripts.is_empty() {
-            // The list separator of mpv's path lists on Windows.
-            options.push(("scripts".into(), scripts.join(";")));
+            options.push(("scripts".into(), scripts.join(PATH_LIST_SEPARATOR)));
         }
         // mpv only honours the key bindings that scripts register by default (`mp.add_key_binding`) while its own default
         // bindings are on, so they are on, with the few that would end the player or the file blocked first. The
@@ -211,7 +213,8 @@ pub fn named_key(key: egui::Key) -> Option<&'static str> {
     })
 }
 
-/// The character a letter or digit key types without Shift, for bindings with Ctrl or Alt held (those type no text).
+/// The character a letter or digit key types without Shift, for bindings with Ctrl, Alt or Command held (those type no
+/// text).
 pub fn plain_key(key: egui::Key, shift: bool) -> Option<char> {
     let name = key.name();
     let mut chars = name.chars();
@@ -230,6 +233,10 @@ pub fn with_modifiers(name: &str, modifiers: &egui::Modifiers) -> String {
     }
     if modifiers.alt {
         out.push_str("alt+");
+    }
+    // The Command key. Elsewhere egui never reports it.
+    if modifiers.mac_cmd {
+        out.push_str("meta+");
     }
     out.push_str(name);
     out
@@ -267,6 +274,9 @@ mod tests {
         assert_eq!(plain_key(egui::Key::ArrowLeft, false), None);
         let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
         assert_eq!(with_modifiers("LEFT", &ctrl), "ctrl+LEFT");
+        let cmd = egui::Modifiers { mac_cmd: true, command: true, ..Default::default() };
+        assert_eq!(with_modifiers("s", &cmd), "meta+s");
+        assert_eq!(normalize("Meta+s"), normalize("meta+s"));
     }
 
     #[test]

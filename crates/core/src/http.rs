@@ -3,7 +3,7 @@
 //! Two things matter on real networks, both measured on the Kotlin build: addon hosts that publish an IPv6 address
 //! nobody can reach (a connection attempt that takes 20 s to fail), and a system resolver that sometimes needs a second
 //! or two per lookup. The client therefore sorts IPv4 first, remembers lookups for five minutes and gives up on a
-//! connect after eight seconds. Windows proxy settings are honoured.
+//! connect after eight seconds. The system proxy settings are honoured.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,6 +14,9 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 const DNS_TTL: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "macos")]
+const USER_AGENT: &str = concat!("Nuvio/", env!("CARGO_PKG_VERSION"), " (macOS)");
+#[cfg(not(target_os = "macos"))]
 const USER_AGENT: &str = concat!("Nuvio/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
 #[derive(Debug, thiserror::Error)]

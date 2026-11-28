@@ -28,6 +28,19 @@ out on purpose. This table says what the Rust build does today. "Partly" always 
 | Auto update | not applicable | There is no update feed. |
 | Deep links (`nuvio://`) | not applicable | The installer does not claim the scheme, so it does not fight the Kotlin build for it. |
 
+## macOS
+
+The same screens and features as Windows, on Apple Silicon. Video is decoded by VideoToolbox and drawn through OpenGL.
+
+| Area | State | Notes |
+| --- | --- | --- |
+| Playback | done | H.264 and HEVC 10-bit over files and HTTP(S), hardware decoded. |
+| Dolby Vision profile 5 | not yet | The bundled FFmpeg has no `libplacebo` filter: the file plays with wrong colours. Not tried with a real file. |
+| Torrents | untested | Builds, with the open file limit raised; no torrent has been played on a Mac. |
+| Import from the Kotlin build | not yet | Where its macOS build keeps addons has not been looked up. The offer stays hidden. |
+| Signing and notarization | not applicable | Signed ad hoc; see the README for the first start. |
+| Intel Macs | not yet | |
+
 ## Where behaviour differs on purpose
 
 * **Data folder.** `%APPDATA%\NuvioRust` and `%LOCALAPPDATA%\NuvioRust`, so the Kotlin and Rust builds can be installed

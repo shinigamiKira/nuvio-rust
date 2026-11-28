@@ -10,3 +10,6 @@ rust-version.workspace = true
 libloading = "0.9.0"
 thiserror = "2.0.21"
 tracing = "0.1.44"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"

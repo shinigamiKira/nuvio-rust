@@ -26,6 +26,32 @@ const SKIP_SECS: f32 = 5.0;
 const FALLBACK_CREDITS_SECS: f64 = 40.0;
 const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
+/// A step longer than this between two passes does not count in full: nothing was drawn, so nothing was seen counting.
+const LONGEST_STEP: Duration = Duration::from_millis(500);
+
+/// Time that only passes while it is told to: the seconds an announcement has been up with the video going on.
+#[derive(Clone, Copy)]
+struct Countdown {
+    ran: Duration,
+    seen: Instant,
+}
+
+impl Countdown {
+    fn new(now: Instant) -> Self {
+        Self { ran: Duration::ZERO, seen: now }
+    }
+
+    /// Moves on to `now` and returns the seconds counted so far.
+    fn tick(&mut self, running: bool, now: Instant) -> f32 {
+        let step = now.saturating_duration_since(self.seen);
+        self.seen = now;
+        if running {
+            self.ran += step.min(LONGEST_STEP);
+        }
+        self.ran.as_secs_f32()
+    }
+}
+
 pub enum Hud {
     Volume(f64, bool),
     Seek(String),
@@ -154,7 +180,7 @@ pub struct Session {
     /// What the episode before this one left behind, when this one was opened from it.
     pub carry: Option<Carry>,
     carry_tracks_applied: bool,
-    skip_timer: Option<(Skippable, Instant)>,
+    skip_timer: Option<(Skippable, Countdown)>,
     skipped: Vec<Skippable>,
     opened: Instant,
     last_motion: Instant,
@@ -163,7 +189,7 @@ pub struct Session {
     aspect: Aspect,
     show_stats: bool,
     pub last_saved: Instant,
-    ended_at: Option<Instant>,
+    up_next: Option<Countdown>,
     autoplay_cancelled: bool,
     last_volume: f64,
     /// When the wheel last turned, and how many notches have followed each other closely since.
@@ -197,13 +223,19 @@ impl Session {
             aspect: Aspect::Fit,
             show_stats: false,
             last_saved: Instant::now(),
-            ended_at: None,
+            up_next: None,
             autoplay_cancelled: false,
             last_volume: 100.0,
             wheel_at: Instant::now(),
             wheel_streak: 0,
             mouse_sent: None,
         }
+    }
+
+    /// A picture is moving: not still opening, paused, over or failed.
+    pub fn is_moving(&self) -> bool {
+        let state = &self.player.state;
+        state.started && !state.paused && !state.ended && state.error.is_none()
     }
 
     pub fn episode_label(&self) -> Option<String> {
@@ -516,20 +548,7 @@ fn handle_wheel(session: &mut Session, ctx: &egui::Context, rect: Rect, custom: 
     if Popup::is_any_open(ctx) || !ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p))) {
         return;
     }
-    let notches: f32 = ctx.input(|i| {
-        i.events
-            .iter()
-            .filter_map(|event| match event {
-                egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
-                    egui::MouseWheelUnit::Line => delta.y,
-                    egui::MouseWheelUnit::Page => delta.y * 10.0,
-                    // A touchpad reports points: about forty of them make one notch of a wheel.
-                    egui::MouseWheelUnit::Point => delta.y / 40.0,
-                }),
-                _ => None,
-            })
-            .sum()
-    });
+    let (notches, fingers) = ctx.input(|i| wheel_notches(&i.events));
     if notches == 0.0 {
         return;
     }
@@ -540,10 +559,34 @@ fn handle_wheel(session: &mut Session, ctx: &egui::Context, rect: Rect, custom: 
         }
         return;
     }
-    session.wheel_streak = if session.wheel_at.elapsed() <= WHEEL_STREAK_GAP { (session.wheel_streak + 1).min(8) } else { 0 };
+    // Only the notches of a wheel build up speed. A trackpad reports many small movements, which follow the fingers.
+    session.wheel_streak = if !fingers && session.wheel_at.elapsed() <= WHEEL_STREAK_GAP { (session.wheel_streak + 1).min(8) } else { 0 };
     session.wheel_at = Instant::now();
     let step = WHEEL_VOLUME_STEP * (1.0 + 0.35 * session.wheel_streak as f64);
     session.adjust_volume(notches as f64 * step);
+}
+
+/// How far the wheel turned in these events, in notches, and whether it was fingers on a trackpad. What the system adds
+/// after the fingers have lifted (momentum) is left out: the volume stops where the person stopped.
+fn wheel_notches(events: &[egui::Event]) -> (f32, bool) {
+    let mut fingers = false;
+    let notches = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel { source: egui::MouseWheelSource::Momentum, .. } => None,
+            egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                egui::MouseWheelUnit::Line => delta.y,
+                egui::MouseWheelUnit::Page => delta.y * 10.0,
+                // A trackpad reports points: about forty of them make one notch of a wheel.
+                egui::MouseWheelUnit::Point => {
+                    fingers = true;
+                    delta.y / 40.0
+                }
+            }),
+            _ => None,
+        })
+        .sum();
+    (notches, fingers)
 }
 
 /// Hands mpv the keys and pointer movements Nuvio has no use for, so the scripts and bindings the person loaded can act on
@@ -559,15 +602,15 @@ fn forward_input(session: &mut Session, ctx: &egui::Context, custom: &Custom) {
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     if let Some(name) = mpv_custom::named_key(*key) {
                         out.push(mpv_custom::with_modifiers(name, modifiers));
-                    } else if modifiers.ctrl || modifiers.alt {
-                        // With Ctrl or Alt held a key types no text, so it is named after the key itself.
+                    } else if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
+                        // With Ctrl, Alt or Command held a key types no text, so it is named after the key itself.
                         if let Some(plain) = mpv_custom::plain_key(*key, modifiers.shift) {
                             out.push(mpv_custom::with_modifiers(&plain.to_string(), modifiers));
                         }
                     }
                 }
                 // What the key typed: the right character for the keyboard layout and for Shift.
-                egui::Event::Text(text) if !i.modifiers.ctrl && !i.modifiers.alt => {
+                egui::Event::Text(text) if !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.mac_cmd => {
                     out.extend(text.chars().filter(|c| !c.is_control() && *c != ' ').map(|c| c.to_string()));
                 }
                 _ => {}
@@ -597,6 +640,8 @@ fn handle_keys(session: &mut Session, ctx: &egui::Context, actions: &mut Vec<Act
     }
     // A key that the person's input.conf binds belongs to mpv, so none of the player's own code below runs for it.
     let mine = |name: &str| !custom.binds(name);
+    // With a menu open, Escape closes the menu and nothing else.
+    let menu_open = Popup::is_any_open(ctx);
     let (space, k, left, right, up, down, m, f, f11, esc, shift, ctrl, alt, speed_up, speed_down, back_nav) = ctx.input(|i| {
         (
             i.key_pressed(Key::Space) && mine("SPACE"),
@@ -605,16 +650,17 @@ fn handle_keys(session: &mut Session, ctx: &egui::Context, actions: &mut Vec<Act
             (i.key_pressed(Key::ArrowRight) && mine("RIGHT")) || (i.key_pressed(Key::L) && mine("l")),
             i.key_pressed(Key::ArrowUp) && mine("UP"),
             i.key_pressed(Key::ArrowDown) && mine("DOWN"),
-            i.key_pressed(Key::M) && mine("m"),
+            // Command + M minimizes the window.
+            i.key_pressed(Key::M) && !i.modifiers.mac_cmd && mine("m"),
             i.key_pressed(Key::F) && mine("f"),
             i.key_pressed(Key::F11) && mine("F11"),
-            i.key_pressed(Key::Escape) && mine("ESC"),
+            i.key_pressed(Key::Escape) && !menu_open && mine("ESC"),
             i.modifiers.shift,
             i.modifiers.command,
             i.modifiers.alt,
             i.key_pressed(Key::Period) && i.modifiers.shift,
             i.key_pressed(Key::Comma) && i.modifiers.shift,
-            i.pointer.button_pressed(egui::PointerButton::Extra1),
+            i.pointer.button_pressed(egui::PointerButton::Extra1) || (i.modifiers.command && i.key_pressed(Key::OpenBracket)),
         )
     });
     if space || k {
@@ -683,6 +729,7 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
     let text_h = title.size().y + label.as_ref().map_or(0.0, |g| g.size().y + 2.0);
     let pill = Rect::from_center_size(pos2(back.right() + 12.0 + (text_w + 44.0) / 2.0, back.center().y), vec2(text_w + 44.0, (text_h + 20.0).max(48.0)));
     ui_kit::glass_panel(ui, pill, (pill.height() / 2.0).min(26.0), a);
+    block_clicks(ui, pill, "player-title");
     ui.painter().galley(pos2(pill.left() + 22.0, pill.center().y - text_h / 2.0), title.clone(), Color32::WHITE);
     if let Some(label) = label {
         ui.painter().galley(pos2(pill.left() + 22.0, pill.center().y - text_h / 2.0 + title.size().y + 2.0), label, Color32::WHITE);
@@ -724,6 +771,7 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
     let panel_w = (rect.width() - 40.0).min(1500.0);
     let panel = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 22.0 - 55.0), vec2(panel_w, 110.0));
     ui_kit::glass_panel(ui, panel, 32.0, a);
+    block_clicks(ui, panel, "player-panel");
     let bar_left = panel.left() + 30.0;
     let bar_right = panel.right() - 30.0;
     timeline(session, ui, bar_left, bar_right, panel.top() + 30.0, a);
@@ -873,6 +921,12 @@ fn controls(session: &mut Session, ui: &mut Ui, rect: Rect, visible: f32, action
     let _ = t;
 }
 
+/// A panel over the video keeps the clicks that land on it: without this they reach the picture, which pauses and goes
+/// full screen. Call it before the panel's own buttons, which then take precedence.
+fn block_clicks(ui: &Ui, rect: Rect, id: &str) {
+    ui.interact(rect, egui::Id::unique(id), Sense::click());
+}
+
 /// A menu body that scrolls when it is taller than the window: an addon can offer a subtitle in forty languages.
 fn scrolling<R>(ui: &mut Ui, max_height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     egui::ScrollArea::vertical().max_height(max_height).auto_shrink([true, true]).show(ui, add_contents).inner
@@ -1015,6 +1069,7 @@ fn stats(session: &mut Session, ui: &mut Ui, rect: Rect) {
     let t = theme::get();
     let panel = Rect::from_min_size(rect.right_top() + vec2(-390.0, 92.0), vec2(366.0, 28.0 + lines.len() as f32 * 24.0));
     ui_kit::glass_panel(ui, panel, 22.0, 1.0);
+    block_clicks(ui, panel, "player-stats");
     for (i, (label, value)) in lines.iter().enumerate() {
         let y = panel.top() + 24.0 + i as f32 * 24.0;
         ui_kit::draw_text(ui, pos2(panel.left() + 16.0, y), Align2::LEFT_CENTER, label, theme::semibold(size::LABEL_SM), t.text_muted);
@@ -1027,6 +1082,7 @@ fn error_card(ui: &mut Ui, rect: Rect, error: &str, actions: &mut Vec<Action>) {
     let t = theme::get();
     let card = Rect::from_center_size(rect.center(), vec2(480.0, 190.0));
     ui_kit::glass_panel(ui, card, 24.0, 1.0);
+    block_clicks(ui, card, "player-error");
     ui_kit::draw_text(ui, card.center_top() + vec2(0.0, 40.0), Align2::CENTER_CENTER, "This stream could not be played", theme::bold(size::TITLE_SM), t.text);
     let g = ui_kit::galley(ui, error, theme::regular(size::BODY_SM), t.text_muted, 420.0, 3);
     ui.painter().galley(pos2(card.center().x - g.size().x / 2.0, card.top() + 66.0), g, t.text_muted);
@@ -1040,18 +1096,22 @@ fn error_card(ui: &mut Ui, rect: Rect, error: &str, actions: &mut Vec<Action>) {
 /// few seconds.
 fn next_episode_card(session: &mut Session, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>, auto_play_next: bool) {
     let Some(next) = session.next_episode().filter(|_| session.credits_now()) else {
-        session.ended_at = None;
+        session.up_next = None;
         return;
     };
-    let started = *session.ended_at.get_or_insert_with(Instant::now);
+    // The end of the file pauses the player by itself, and the count goes on from there.
+    let state = &session.player.state;
+    let running = state.ended || (!state.paused && !state.buffering);
+    let now = Instant::now();
+    let elapsed = session.up_next.get_or_insert_with(|| Countdown::new(now)).tick(running, now);
     let t = theme::get();
     let card = Rect::from_min_size(pos2(rect.right() - 440.0, rect.bottom() - 260.0), vec2(412.0, 120.0));
     ui_kit::glass_panel(ui, card, 22.0, 1.0);
+    block_clicks(ui, card, "next-episode-card");
     ui_kit::draw_text(ui, card.left_top() + vec2(22.0, 26.0), Align2::LEFT_CENTER, "Up next", theme::semibold(size::LABEL_SM), t.text_muted);
     let title = format!("{} · {}", next.code().unwrap_or_default(), next.title);
     let g = ui_kit::galley(ui, &title, theme::bold(size::BODY_LG), t.text, 370.0, 1);
     ui.painter().galley(card.left_top() + vec2(22.0, 42.0), g, t.text);
-    let elapsed = started.elapsed().as_secs_f32();
     let counting = auto_play_next && !session.autoplay_cancelled;
     let mut row = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(card.left_top() + vec2(18.0, 68.0), vec2(380.0, 40.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
     let label = if counting { format!("Play now  ({:.0})", (AUTOPLAY_SECS - elapsed).ceil().max(0.0)) } else { "Play now".to_owned() };
@@ -1059,11 +1119,11 @@ fn next_episode_card(session: &mut Session, ui: &mut Ui, rect: Rect, actions: &m
     if counting && ui_kit::pill_button(&mut row, None, "Cancel", ui_kit::PillStyle::Soft).clicked() {
         session.autoplay_cancelled = true;
     }
-    if counting {
+    if counting && running {
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
-    if play || (counting && elapsed >= AUTOPLAY_SECS) {
-        session.ended_at = None;
+    if play || (counting && running && elapsed >= AUTOPLAY_SECS) {
+        session.up_next = None;
         actions.push(Action::PlayEpisode(next));
     }
 }
@@ -1075,15 +1135,14 @@ fn skip_prompt(session: &mut Session, ui: &mut Ui, rect: Rect, auto_skip: bool, 
         session.skip_timer = None;
         return;
     };
-    let since = match session.skip_timer {
-        Some((current, at)) if current == kind => at,
-        _ => {
-            let now = Instant::now();
-            session.skip_timer = Some((kind, now));
-            now
-        }
+    let running = !session.player.state.paused && !session.player.state.buffering;
+    let now = Instant::now();
+    let mut countdown = match session.skip_timer {
+        Some((current, countdown)) if current == kind => countdown,
+        _ => Countdown::new(now),
     };
-    let remaining = (SKIP_SECS - since.elapsed().as_secs_f32()).max(0.0);
+    let remaining = (SKIP_SECS - countdown.tick(running, now)).max(0.0);
+    session.skip_timer = Some((kind, countdown));
     let t = theme::get();
     let text = ui_kit::galley(ui, kind.label(), theme::semibold(size::BODY_MD), Color32::WHITE, 260.0, 1);
     let ring = if auto_skip { 34.0 } else { 0.0 };
@@ -1126,13 +1185,45 @@ fn skip_prompt(session: &mut Session, ui: &mut Ui, rect: Rect, auto_skip: bool, 
     if cross_response.clicked() {
         session.skipped.push(kind);
         session.skip_timer = None;
-    } else if response.clicked() || (auto_skip && remaining <= 0.0) {
+    } else if response.clicked() || (auto_skip && running && remaining <= 0.0) {
         let duration = session.player.state.duration;
         session.player.seek_to(if duration > 0.0 { end.min(duration) } else { end });
         session.skipped.push(kind);
         session.skip_timer = None;
         session.show_hud(Hud::Seek(kind.done().to_owned()));
-    } else if auto_skip {
+    } else if auto_skip && running {
         ui.ctx().request_repaint_after(Duration::from_millis(33));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_countdown_stands_still_while_it_is_held() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut countdown = Countdown::new(start);
+        assert_eq!(countdown.tick(true, at(250)), 0.25);
+        // Paused for a minute, with a pass now and then, or none at all.
+        assert_eq!(countdown.tick(false, at(500)), 0.25);
+        assert_eq!(countdown.tick(false, at(60_000)), 0.25);
+        assert_eq!(countdown.tick(true, at(60_250)), 0.5);
+        // The first pass after a long silence adds one step, not the silence.
+        assert_eq!(countdown.tick(true, at(120_000)), 1.0);
+    }
+
+    fn wheel(unit: egui::MouseWheelUnit, y: f32, source: egui::MouseWheelSource) -> egui::Event {
+        egui::Event::MouseWheel { unit, delta: vec2(0.0, y), phase: egui::TouchPhase::Move, source, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn momentum_after_a_swipe_does_not_turn_the_volume() {
+        use egui::{MouseWheelSource as Source, MouseWheelUnit as Unit};
+        let events = [wheel(Unit::Point, 20.0, Source::Trackpad), wheel(Unit::Point, 200.0, Source::Momentum)];
+        assert_eq!(wheel_notches(&events), (0.5, true));
+        assert_eq!(wheel_notches(&[wheel(Unit::Line, -2.0, Source::Wheel)]), (-2.0, false));
+        assert_eq!(wheel_notches(&[]), (0.0, false));
     }
 }

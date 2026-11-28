@@ -1,7 +1,7 @@
 //! The part of libmpv's C API Nuvio uses, resolved from the DLL at run time.
 //!
-//! libmpv is loaded with `LoadLibrary` instead of being linked, so the app starts (and can explain what is missing)
-//! when the DLL is not next to it, and no import library is needed to build.
+//! libmpv is loaded at run time instead of being linked, so the app starts (and can explain what is missing) when the
+//! library is not there, and no import library is needed to build.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -138,41 +138,65 @@ api! {
 }
 
 /// File names libmpv builds are published under.
-const DLL_NAMES: [&str; 2] = ["libmpv-2.dll", "mpv-2.dll"];
+#[cfg(target_os = "macos")]
+const LIBRARY_NAMES: [&str; 2] = ["libmpv.2.dylib", "libmpv.dylib"];
+#[cfg(not(target_os = "macos"))]
+const LIBRARY_NAMES: [&str; 2] = ["libmpv-2.dll", "mpv-2.dll"];
 
-/// Where to look, in order: `NUVIO_LIBMPV`, the folder of the running exe, `libs/windows-x64` above it (a source
-/// checkout), then whatever the Windows loader finds on its own.
+/// Where a source checkout keeps the library, under `libs`.
+#[cfg(target_os = "macos")]
+const CHECKOUT_DIR: &str = "macos-arm64";
+#[cfg(not(target_os = "macos"))]
+const CHECKOUT_DIR: &str = "windows-x64";
+
+/// Where to look, in order: `NUVIO_LIBMPV`, then around the running program (see `beside`), then on macOS Homebrew, then
+/// whatever the system loader finds on its own.
 fn candidates() -> Vec<PathBuf> {
     let mut found = Vec::new();
     if let Some(path) = std::env::var_os("NUVIO_LIBMPV") {
         found.push(PathBuf::from(path));
     }
     if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent();
-        for depth in 0..5 {
-            let Some(current) = dir else { break };
-            for name in DLL_NAMES {
-                found.push(current.join(name));
-                if depth > 0 {
-                    found.push(current.join("libs").join("windows-x64").join(name));
-                }
-            }
-            dir = current.parent();
-        }
+        found.extend(beside(&exe));
     }
-    for name in DLL_NAMES {
-        found.push(PathBuf::from(name));
+    found.extend(LIBRARY_NAMES.iter().map(PathBuf::from));
+    found
+}
+
+/// The places that go with a program at `exe`. In an application bundle that is the bundle's `Frameworks` folder and
+/// nothing else on disk, so a packaged app never picks up another copy. Otherwise it is the program's folder,
+/// `libs/<platform>` above it (a source checkout) and, on macOS, Homebrew.
+fn beside(exe: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(contents) = exe.parent().filter(|dir| dir.ends_with("Contents/MacOS")).and_then(Path::parent) {
+        return LIBRARY_NAMES.iter().map(|name| contents.join("Frameworks").join(name)).collect();
+    }
+    let mut dir = exe.parent();
+    for depth in 0..5 {
+        let Some(current) = dir else { break };
+        for name in LIBRARY_NAMES {
+            found.push(current.join(name));
+            if depth > 0 {
+                found.push(current.join("libs").join(CHECKOUT_DIR).join(name));
+            }
+        }
+        dir = current.parent();
+    }
+    #[cfg(target_os = "macos")]
+    for name in LIBRARY_NAMES {
+        found.push(Path::new("/opt/homebrew/lib").join(name));
     }
     found
 }
 
 pub(crate) fn load() -> Result<Api, Error> {
-    let mut last = String::from("libmpv-2.dll was not found");
+    let mut last = format!("{} was not found", LIBRARY_NAMES[0]);
     for path in candidates() {
-        if path.components().count() > 1 && !Path::new(&path).exists() {
+        if path.components().count() > 1 && !path.exists() {
             continue;
         }
-        // SAFETY: loading a DLL runs its initialisers; libmpv's are the normal ones.
+        // SAFETY: loading a library runs its initialisers; libmpv's are the normal ones.
         match unsafe { Library::new(&path) } {
             Ok(library) => {
                 tracing::info!(path = %path.display(), "libmpv loaded");
@@ -182,4 +206,23 @@ pub(crate) fn load() -> Result<Api, Error> {
         }
     }
     Err(Error::Load(last))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bundled_app_only_looks_inside_its_bundle() {
+        let found = beside(Path::new("/Applications/Nuvio.app/Contents/MacOS/nuvio"));
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|p| p.starts_with("/Applications/Nuvio.app/Contents/Frameworks")), "{found:?}");
+    }
+
+    #[test]
+    fn a_source_checkout_looks_in_libs_and_homebrew() {
+        let found = beside(Path::new("/src/nuvio/target/debug/nuvio"));
+        assert!(found.contains(&PathBuf::from("/src/nuvio/libs/macos-arm64/libmpv.2.dylib")), "{found:?}");
+        assert!(found.contains(&PathBuf::from("/opt/homebrew/lib/libmpv.2.dylib")), "{found:?}");
+    }
 }

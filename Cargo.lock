@@ -2913,12 +2913,16 @@ dependencies = [
  "epaint",
  "fast_image_resize",
  "image",
+ "libc",
  "librqbit",
  "librqbit-core",
  "librqbit-dualstack-sockets",
  "librqbit-sha1-wrapper",
  "nuvio-core",
  "nuvio-mpv",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "serde",
  "serde_json",
  "tokio",
@@ -2947,6 +2951,7 @@ dependencies = [
 name = "nuvio-mpv"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading 0.9.0",
  "thiserror 2.0.21",
  "tracing",

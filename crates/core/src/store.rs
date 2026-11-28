@@ -17,12 +17,19 @@ pub fn unix_seconds() -> u64 {
 /// One JSON file. A missing or unreadable file is an empty state, never an error: the app must start.
 pub struct JsonFile<T> {
     path: PathBuf,
+    /// Readable by the owner only (it holds access tokens). Windows keeps the profile folder to its owner already.
+    private: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Default> JsonFile<T> {
     pub fn new(name: &str) -> Self {
-        Self { path: paths::roaming_data_dir().join(name), _marker: std::marker::PhantomData }
+        Self { path: paths::roaming_data_dir().join(name), private: false, _marker: std::marker::PhantomData }
+    }
+
+    /// A file that holds secrets: only its owner may read it.
+    pub fn private(name: &str) -> Self {
+        Self { private: true, ..Self::new(name) }
     }
 
     pub fn load(&self) -> T {
@@ -45,12 +52,30 @@ impl<T: Serialize + DeserializeOwned + Default> JsonFile<T> {
         let temp = self.path.with_extension("tmp");
         let result = serde_json::to_vec_pretty(value)
             .map_err(std::io::Error::other)
-            .and_then(|bytes| fs::write(&temp, bytes))
+            .and_then(|bytes| write_file(&temp, &bytes, self.private))
             .and_then(|_| fs::rename(&temp, &self.path));
         if let Err(error) = result {
             tracing::warn!(file = %self.path.display(), %error, "could not save state");
         }
     }
+}
+
+#[cfg(unix)]
+fn write_file(path: &std::path::Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if !private {
+        return fs::write(path, bytes);
+    }
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    // The mode above only applies to a new file; one left behind by an earlier run keeps its own.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_file(path: &std::path::Path, bytes: &[u8], _private: bool) -> std::io::Result<()> {
+    fs::write(path, bytes)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -446,6 +471,21 @@ mod tests {
         assert!(library.contains("movie", "tt1"));
         assert!(!library.toggle(item));
         assert!(library.items.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("nuvio-test-private-{}.json", std::process::id()));
+        let temp = path.with_extension("tmp");
+        // A temporary file left behind with open permissions must not pass them on.
+        fs::write(&temp, b"old").unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = JsonFile::<SearchHistory> { path: path.clone(), private: true, _marker: std::marker::PhantomData };
+        file.save(&SearchHistory::default());
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -2,7 +2,6 @@
 
 mod app;
 mod args;
-mod compositor;
 mod glass;
 mod icons;
 mod images;
@@ -46,7 +45,9 @@ fn main() -> anyhow::Result<()> {
 
     let saved = nuvio_core::store::JsonFile::<nuvio_core::store::Settings>::new("settings.json").load().window;
     let (mut viewport, centered) = window::initial_viewport(args.fullscreen, args.size, saved);
-    if let Some(icon) = window_icon() {
+    // An empty icon tells eframe to leave the system's alone; without one it would set its own.
+    let icon = if platform::use_runtime_icon() { window_icon() } else { Some(egui::IconData::default()) };
+    if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, centered, multisampling: 0, ..Default::default() };
@@ -66,12 +67,8 @@ fn install_panic_hook() {
         let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
         let message = info.payload().downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
         tracing::error!(%location, %message, "Nuvio crashed");
-        let text: Vec<u16> = format!("Nuvio hit an error and has to close.\n\nDetails are in:\n{}\n", logging::log_dir().join("nuvio.log").display()).encode_utf16().chain(Some(0)).collect();
-        let title: Vec<u16> = "Nuvio".encode_utf16().chain(Some(0)).collect();
-        // SAFETY: both strings are NUL terminated and outlive the call.
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR);
-        }
+        let text = format!("Nuvio hit an error and has to close.\n\nDetails are in:\n{}\n", logging::log_dir().join("nuvio.log").display());
+        platform::show_fatal_error("Nuvio", &text);
     }));
 }
 

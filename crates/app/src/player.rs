@@ -25,7 +25,16 @@ const DV_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RECOVERIES: u32 = 5;
 /// In the order to try them. NVDEC hands its frames to OpenGL without a copy (35 % of a core on a 30 fps 2160p HEVC
 /// file, against 90 % for the copy-back decoders); the copy-back ones are for GPUs that cannot do that through OpenGL.
+#[cfg(not(target_os = "macos"))]
 const HARDWARE_DECODERS: &str = "nvdec,d3d11va-copy,dxva2-copy";
+/// A filter takes frames in memory: the decoder that copies them back.
+#[cfg(not(target_os = "macos"))]
+const COPY_BACK_DECODER: &str = "nvdec-copy";
+/// VideoToolbox shares its frames with OpenGL without a copy.
+#[cfg(target_os = "macos")]
+const HARDWARE_DECODERS: &str = "videotoolbox,videotoolbox-copy";
+#[cfg(target_os = "macos")]
+const COPY_BACK_DECODER: &str = "videotoolbox-copy";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
@@ -143,6 +152,14 @@ pub struct State {
     pub seeking: bool,
     /// The colour matrix of the picture after the filters (`video-out-params/colormatrix`).
     out_matrix: Option<String>,
+}
+
+impl State {
+    /// The state as a file is (re)opened: nothing is known about the file yet. Volume, mute, speed and pause belong to
+    /// the player, which keeps them from one file to the next and does not report them again.
+    fn for_load(&self) -> State {
+        State { volume: self.volume, muted: self.muted, speed: self.speed, paused: self.paused, ..State::default() }
+    }
 }
 
 /// What a player needs to know to open a stream.
@@ -359,6 +376,14 @@ impl Player {
             ("save-position-on-quit".into(), "no".into()),
             ("config".into(), "no".into()),
         ];
+        // The TLS library FFmpeg is built with on macOS looks for certificate authorities where it was built (inside
+        // Homebrew), which a Mac running the packaged app does not have. The system keeps a copy of its own.
+        if cfg!(target_os = "macos") {
+            options.push(("tls-ca-file".into(), "/etc/ssl/cert.pem".into()));
+            // mpv hands a stream that failed to open to yt-dlp, which Homebrew installs along with it. A stream URL carries
+            // the addon's token, and the error should show at once.
+            options.push(("ytdl".into(), "no".into()));
+        }
         // The person's own scripts, key bindings and options come after ours, so theirs win.
         options.extend(custom.options.iter().cloned());
         if let Ok(extra) = std::env::var("NUVIO_MPV_OPTS") {
@@ -450,7 +475,7 @@ impl Player {
 
     /// Opens a stream. The load starts on the first frame after the video surface exists.
     pub fn open(&mut self, source: Source) {
-        self.state = State { volume: self.state.volume, muted: self.state.muted, speed: 1.0, ..State::default() };
+        self.state = self.state.for_load();
         self.pending = Some(source);
         self.ctx_repaint();
     }
@@ -471,12 +496,12 @@ impl Player {
     /// Sends the file to mpv. `extra` are per-file options (a filter, a decoder) that only apply to this load.
     fn load(&mut self, source: &Source, extra: &[String], start: f64) {
         self.opened = Instant::now();
-        self.state = State { volume: self.state.volume, muted: self.state.muted, speed: 1.0, ..State::default() };
+        self.state = self.state.for_load();
         self.rebuffer_at = None;
         self.last_extra = extra.to_vec();
         let _ = self.mpv.set_str("cache-pause-wait", &START_BUFFER_SECS.to_string());
         let headers: Vec<String> = source.headers.iter().map(|(name, value)| format!("{name}: {value}")).collect();
-        let _ = self.mpv.set_str("http-header-fields", &headers.join(","));
+        let _ = self.mpv.set_list("http-header-fields", &headers);
         let mut options: Vec<String> = Vec::new();
         if start > 1.0 {
             options.push(format!("start={start:.3}"));
@@ -516,7 +541,7 @@ impl Player {
                 // the picture green and purple, so the decode is copied back: NVDEC keeps up at 4K, other GPUs fall back
                 // to software decoding.
                 if self.hardware_decoding {
-                    extra.push("hwdec=nvdec-copy".into());
+                    extra.push(format!("hwdec={COPY_BACK_DECODER}"));
                 }
                 tracing::info!("Dolby Vision profile 5: opening again with libplacebo");
                 self.dolby_vision = DolbyVision::Opening;
@@ -593,7 +618,8 @@ impl Player {
         let _ = self.mpv.set_bool("mute", muted);
     }
 
-    pub fn set_speed(&self, speed: f64) {
+    pub fn set_speed(&mut self, speed: f64) {
+        self.state.speed = speed;
         let _ = self.mpv.set_f64("speed", speed);
     }
 
@@ -742,6 +768,9 @@ impl Player {
         tracing::warn!(attempt = self.recoveries, position = at as u64, "the stream ended early, opening it again");
         let extra = self.last_extra.clone();
         self.load(&source, &extra, at);
+        // At the end of a file `keep-open` pauses the player, and the pause would hold the reopened stream too.
+        self.set_paused(false);
+        self.state.paused = false;
     }
 
     fn apply_property(&mut self, name: &str, value: &Value) {
@@ -817,5 +846,18 @@ impl Drop for Player {
     /// Players are only dropped from the UI thread, where the GL context is current.
     fn drop(&mut self) {
         self.surface.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopening_a_file_keeps_what_belongs_to_the_player() {
+        let playing = State { volume: 55.0, muted: true, speed: 1.5, paused: true, position: 90.0, started: true, ..State::default() };
+        let reopened = playing.for_load();
+        assert_eq!((reopened.volume, reopened.muted, reopened.speed, reopened.paused), (55.0, true, 1.5, true));
+        assert_eq!((reopened.position, reopened.started), (0.0, false));
     }
 }

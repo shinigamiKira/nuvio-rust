@@ -12,6 +12,7 @@ pub mod search;
 pub mod settings;
 pub mod streams;
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nuvio_core::meta::{MetaPreview, Video};
@@ -104,6 +105,9 @@ pub struct ViewState {
     /// Streams already warmed up, so resting on one card twice asks once.
     pub warmed: std::collections::HashSet<String>,
     pub hovered_stream: Option<(usize, Instant)>,
+    /// The sizes of the image and addon response caches, once the background has added them up, and when it was asked.
+    pub cache_sizes: Arc<Mutex<Option<(u64, u64)>>>,
+    pub cache_sizes_asked: Option<Instant>,
 }
 
 impl Default for ViewState {
@@ -123,6 +127,8 @@ impl Default for ViewState {
             search_focused: false,
             warmed: Default::default(),
             hovered_stream: None,
+            cache_sizes: Default::default(),
+            cache_sizes_asked: None,
         }
     }
 }

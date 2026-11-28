@@ -36,6 +36,19 @@ pub fn available() -> Result<()> {
     api().map(|_| ())
 }
 
+/// libmpv refuses to start (`mpv_create` returns null) unless numbers are formatted the C way, and a toolkit may have
+/// switched the process to the person's locale.
+fn use_c_numeric_locale() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a constant, NUL terminated locale name; done once, before the first player and its threads exist.
+        ONCE.call_once(|| unsafe {
+            libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+        });
+    }
+}
+
 fn cstring(text: &str) -> CString {
     // A NUL inside a URL or option would end the C string early; dropping it is the only sane reading.
     CString::new(text.replace('\0', "")).unwrap_or_default()
@@ -142,6 +155,7 @@ impl Mpv {
     /// `wakeup` runs on an mpv thread whenever events are waiting, so it must only schedule work (a repaint).
     pub fn new(options: &[(&str, &str)], wakeup: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         let api = api()?.clone();
+        use_c_numeric_locale();
         let wakeup = Box::new(Wakeup(Box::new(wakeup)));
         // SAFETY: plain calls into the C API with valid, NUL terminated strings.
         unsafe {
@@ -199,6 +213,13 @@ impl Mpv {
             (self.api.mpv_set_property_async)(self.handle, 0, n.as_ptr(), sys::FORMAT_STRING, &mut data as *mut *const c_char as *mut c_void)
         };
         check(&self.api, code)
+    }
+
+    /// Replaces a list option (`http-header-fields`) with `items`. Each is added on its own, so a comma inside one is
+    /// part of it; set as one string, the commas would cut it up.
+    pub fn set_list(&self, name: &str, items: &[String]) -> Result<()> {
+        self.command(&["change-list", name, "clr", ""])?;
+        items.iter().try_for_each(|item| self.command(&["change-list", name, "append", item]))
     }
 
     pub fn set_f64(&self, name: &str, mut value: f64) -> Result<()> {
