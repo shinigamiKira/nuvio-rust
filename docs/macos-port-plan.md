@@ -14,7 +14,7 @@ signing, notarization and release steps that depend on them.
 | 3 macOS integration | done, except import from NuvioDesktop and Keychain |
 | 4 UI bugs | U1-U16 changed. Reproduced before and checked after on screen or at the server: U1, U2, U3, U5, U7, U8, U10, U11, U13. Unit or libmpv tests only: U4, U6. Not checked at run time: U9, U12, U15, U16. U14 checked on macOS with `pmset` |
 | 5 Packaging | done (`scripts/build-macos.sh`) |
-| 6 Release | not done; nothing is committed or published |
+| 6 Release | partly: the port is on the `macos` branch and the DMG is in `releases/`. No CI, tag or GitHub release |
 
 Also found and fixed during the port: a stream went unattended while the window was minimized or covered; the packaged
 app refused every HTTPS stream without Homebrew's certificate store; mpv handed failed stream URLs to `yt-dlp`.
