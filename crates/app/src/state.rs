@@ -153,7 +153,7 @@ pub struct AccountState {
 
 impl AccountState {
     fn load() -> Self {
-        let file = JsonFile::<Account>::new("account.json");
+        let file = JsonFile::<Account>::private("account.json");
         Self { session: file.load().session, file, busy: false, error: None, notice: None, request: 0, refreshing: false, retry_at: None }
     }
 
@@ -530,6 +530,7 @@ impl State {
         // Show the cached copy at once, then replace it with the fresh one.
         if let Some((meta, _)) = sources.iter().find_map(|url| svc.client.cached_meta(url, kind, id)) {
             if let Some(details) = &mut self.details {
+                details.season = default_season(&meta, &self.progress);
                 details.meta = Load::Ready(Arc::new(meta));
             }
         }

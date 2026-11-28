@@ -15,8 +15,8 @@ use nuvio_core::stream::{Playback, Stream};
 use tokio::runtime::Handle;
 
 use crate::args::Args;
-use crate::compositor::Compositor;
 use crate::images::Images;
+use crate::platform::FramePacer;
 use crate::player::{Player, Source, SubtitleFile};
 use crate::screens::player_view::{self, Carry, Session, SubtitlePick, Torrent};
 use crate::screens::{self, Action, Cx, PlayRequest, Route, Tab, ViewState, nav, opening};
@@ -29,7 +29,7 @@ const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(10);
 const TOAST_FOR: Duration = Duration::from_millis(2800);
 
 pub struct App {
-    compositor: Compositor,
+    pacer: FramePacer,
     args: Args,
     state: State,
     svc: Services,
@@ -42,6 +42,12 @@ pub struct App {
     started: Instant,
     screenshot_requested: bool,
     window: Option<WindowState>,
+    /// What the window last reported about being full screen: the system changes it too (the green button on macOS).
+    window_fullscreen: bool,
+    /// Whether the window was full screen already when the player opened; leaving the player then keeps it so.
+    fullscreen_before_player: bool,
+    /// A modifier the `--key` hook holds, to be let go on the next pass.
+    release_modifiers: bool,
     auto_pick: Option<AutoPick>,
     carried: Option<Carried>,
     opened_from_args: bool,
@@ -104,22 +110,26 @@ impl App {
         crate::subtitles::cache().trim(crate::subtitles::MAX_CACHE_BYTES);
         let images = Images::new(cc.egui_ctx.clone(), runtime.clone(), http, image_cache);
         let (tx, rx) = channel();
+        let args_fullscreen = args.fullscreen;
         let svc = Services::new(runtime, client, images, cc.egui_ctx.clone(), tx);
 
         let mut app = Self {
-            compositor: Compositor::start(),
+            pacer: FramePacer::start(),
             args,
             state,
             svc,
             rx,
             routes: vec![Route::Tab(Tab::Home)],
-            view: ViewState::default(),
+            view: ViewState { fullscreen: args_fullscreen, ..ViewState::default() },
             actions: Vec::new(),
             session: None,
             toasts: Vec::new(),
             started: Instant::now(),
             screenshot_requested: false,
             window: None,
+            window_fullscreen: args_fullscreen,
+            fullscreen_before_player: false,
+            release_modifiers: false,
             auto_pick: None,
             carried: None,
             opened_from_args: false,
@@ -319,7 +329,9 @@ impl App {
                     self.view.fullscreen = on;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
                 }
-                Action::OpenExternal(url) => open_in_browser(&url),
+                Action::OpenExternal(url) => {
+                    crate::platform::open_url(&url);
+                }
                 Action::AddSubtitle { url, title, language } => {
                     if let Some(request) = self.session.as_ref().map(|s| s.subtitles_request) {
                         self.load_subtitle(request, url, title, language, true);
@@ -345,28 +357,66 @@ impl App {
         if matches!(route, Route::Player) || ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        let (f11, search, back) = ctx.input(|i| {
+        let (fullscreen, search, settings, back) = ctx.input(|i| {
+            let command = i.modifiers.command;
             (
-                i.key_pressed(egui::Key::F11),
-                (i.modifiers.command && i.key_pressed(egui::Key::K)) || i.key_pressed(egui::Key::Slash),
-                i.key_pressed(egui::Key::Backspace) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
+                // F11 belongs to the system on a Mac, where full screen is Control + Command + F.
+                i.key_pressed(egui::Key::F11) || (i.modifiers.mac_cmd && i.modifiers.ctrl && i.key_pressed(egui::Key::F)),
+                (command && !i.modifiers.ctrl && (i.key_pressed(egui::Key::K) || i.key_pressed(egui::Key::F))) || i.key_pressed(egui::Key::Slash),
+                command && i.key_pressed(egui::Key::Comma),
+                i.key_pressed(egui::Key::Backspace) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) || (command && i.key_pressed(egui::Key::OpenBracket)),
             )
         });
-        if f11 {
+        if fullscreen {
             self.actions.push(Action::Fullscreen(!self.view.fullscreen));
         }
         if search && !matches!(route, Route::Tab(Tab::Search)) {
             self.actions.push(Action::Tab(Tab::Search));
+        } else if search {
+            self.view.search_focused = false;
+        }
+        if settings && !matches!(route, Route::Tab(Tab::Settings)) {
+            self.actions.push(Action::Tab(Tab::Settings));
         }
         if back && !matches!(route, Route::Tab(_)) {
             self.actions.push(Action::Back);
         }
     }
 
+    /// Command + W and Command + M, which a Mac app is expected to answer to. (Command + Q is in the menu the window
+    /// toolkit makes.) They work on every screen.
+    fn window_shortcuts(&self, ctx: &egui::Context) {
+        let (close, minimize) = ctx.input(|i| (i.modifiers.mac_cmd && i.key_pressed(egui::Key::W), i.modifiers.mac_cmd && i.key_pressed(egui::Key::M)));
+        if close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if minimize {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    }
+
+    /// Follows the window when the system makes it full screen, or ends that. Only a change counts: for a few frames after
+    /// the app asks, the window still reports what it was.
+    fn follow_fullscreen(&mut self, ctx: &egui::Context) {
+        if let Some(now) = ctx.input(|i| i.viewport().fullscreen) {
+            if now != self.window_fullscreen {
+                self.window_fullscreen = now;
+                self.view.fullscreen = now;
+            }
+        }
+    }
+
+    fn show_player(&mut self) {
+        if !matches!(self.current(), Route::Player) {
+            self.fullscreen_before_player = self.view.fullscreen;
+            self.routes.push(Route::Player);
+        }
+    }
+
     fn go_back(&mut self, ctx: &egui::Context) {
         if matches!(self.current(), Route::Player) {
             self.stop_session();
-            if self.view.fullscreen {
+            if self.view.fullscreen && !self.fullscreen_before_player {
                 self.view.fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
@@ -494,8 +544,7 @@ impl App {
                 self.start_torrent(ctx, request.clone(), info_hash, file_idx, trackers);
             }
             Some(Playback::External(url)) => {
-                open_in_browser(&url);
-                self.push_toast("Opened in your browser");
+                self.push_toast(if crate::platform::open_url(&url) { "Opened in your browser" } else { "This link cannot be opened" });
             }
             None => self.push_toast("This stream has nothing to play"),
         }
@@ -562,9 +611,7 @@ impl App {
         self.session = Some(session);
         crate::platform::playback(true);
         self.auto_pick = None;
-        if !matches!(self.current(), Route::Player) {
-            self.routes.push(Route::Player);
-        }
+        self.show_player();
     }
 
     /// The wordmark of the title being opened, from the catalog entry it was picked from, while its details load.
@@ -600,9 +647,7 @@ impl App {
         self.session = Some(session);
         crate::platform::playback(true);
         self.auto_pick = None;
-        if !matches!(self.current(), Route::Player) {
-            self.routes.push(Route::Player);
-        }
+        self.show_player();
         let svc = self.svc.clone();
         self.svc.spawn(async move {
             let result = match svc.engine().await {
@@ -710,6 +755,7 @@ impl App {
     fn stop_session(&mut self) {
         self.save_progress(true);
         crate::platform::playback(false);
+        crate::platform::keep_display_awake(false);
         if let Some(session) = self.session.take() {
             if let Some(torrent) = &session.torrent {
                 torrent.status.stop();
@@ -762,12 +808,7 @@ impl App {
         let Some(pick) = &self.auto_pick else { return };
         let Some(streams) = self.state.streams.as_ref().filter(|s| s.request == pick.request) else { return };
         let candidates: Vec<&Stream> = streams.all_streams().into_iter().filter(|s| s.is_playable()).collect();
-        let by_group = pick.binge_group.as_ref().and_then(|group| candidates.iter().find(|s| s.binge_group.as_ref() == Some(group)));
-        let same_addon_and_quality = candidates.iter().find(|s| {
-            s.addon_id == pick.addon_id
-                && pick.resolution.as_ref().is_some_and(|r| s.facet_values().get(&nuvio_core::stream::Facet::Resolution).is_some_and(|v| v.contains(r)))
-        });
-        let chosen = by_group.or(same_addon_and_quality).map(|s| (*s).clone());
+        let chosen = pick_next(&candidates, pick.binge_group.as_deref(), &pick.addon_id, pick.resolution.as_deref()).cloned();
         let finished = streams.pending() == 0;
         match chosen {
             Some(stream) => {
@@ -787,20 +828,26 @@ impl App {
                 }
                 self.play(ctx, request);
                 self.carried = None;
+                if self.session.is_none() {
+                    self.show_streams_instead("That stream could not be started. Pick another.");
+                }
             }
             // Every addon has answered and none has the stream that was playing: the list is for the viewer to choose from,
             // never a stream picked at random.
-            None if finished => {
-                self.auto_pick = None;
-                if matches!(self.current(), Route::Player) && self.session.is_none() {
-                    self.routes.pop();
-                    if !matches!(self.current(), Route::Streams) {
-                        self.routes.push(Route::Streams);
-                    }
-                    self.push_toast("The stream you were watching is not available for this episode. Pick another.");
-                }
-            }
+            None if finished => self.show_streams_instead("The stream you were watching is not available for this episode. Pick another."),
             None => {}
+        }
+    }
+
+    /// Leaves the screen shown between two episodes for the stream list, when nothing could be played by itself.
+    fn show_streams_instead(&mut self, message: &str) {
+        self.auto_pick = None;
+        if matches!(self.current(), Route::Player) && self.session.is_none() {
+            self.routes.pop();
+            if !matches!(self.current(), Route::Streams) {
+                self.routes.push(Route::Streams);
+            }
+            self.push_toast(message);
         }
     }
 
@@ -949,7 +996,9 @@ impl App {
                 return;
             }
             if let (Some(outer), Some(inner)) = (viewport.outer_rect, viewport.inner_rect) {
-                let maximized = viewport.maximized.unwrap_or(false);
+                // On a Mac this is only known at startup. A zoomed window is saved as the size and place it has, which brings
+                // it back the same.
+                let maximized = !cfg!(target_os = "macos") && viewport.maximized.unwrap_or(false);
                 // A maximized window reports the screen's size; keep the size it had before instead.
                 let previous = self.window.filter(|_| maximized);
                 self.window = Some(WindowState {
@@ -981,9 +1030,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Runs before `ui`, and on its own while the window is minimized or covered. A stream goes on then: mpv waits for
+    /// its frames to be drawn, and progress, skipping and the next episode all live in the pass that draws.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let hidden = ctx.input(|i| i.viewport().visible() == Some(false));
+        if hidden && (self.session.is_some() || self.auto_pick.is_some()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Each frame starts right after the compositor's last pass; see `compositor.rs`.
-        self.compositor.wait_for_pass();
+        // On Windows each frame starts right after the compositor's last pass; see `platform/compositor.rs`.
+        self.pacer.wait_for_pass();
         let ctx = ui.ctx().clone();
         let began = Instant::now();
         if self.perf {
@@ -992,6 +1050,7 @@ impl eframe::App for App {
             }
         }
         self.log_milestones(&ctx);
+        self.follow_fullscreen(&ctx);
         self.drain_messages();
         self.svc.images.begin_frame();
         if !self.opened_from_args {
@@ -1002,6 +1061,8 @@ impl eframe::App for App {
         ui.painter().rect_filled(screen, 0.0, t.background);
 
         let route = self.current().clone();
+        // Asked before the screens draw: an open menu closes itself on Escape, and the key is spent on that.
+        let menu_open = egui::Popup::is_any_open(&ctx);
         {
             let mut cx = Cx { state: &mut self.state, svc: &self.svc, actions: &mut self.actions, view: &mut self.view };
             match &route {
@@ -1033,7 +1094,7 @@ impl eframe::App for App {
                 self.actions.push(Action::OpenAccount);
             }
             // Escape and the mouse's back button leave a page, never a root tab.
-        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.button_pressed(egui::PointerButton::Extra1)) && !ctx.memory(|m| m.focused().is_some()) {
+        } else if ctx.input(|i| (i.key_pressed(egui::Key::Escape) && !menu_open) || i.pointer.button_pressed(egui::PointerButton::Extra1)) && !ctx.memory(|m| m.focused().is_some()) {
             self.actions.push(Action::Back);
         }
 
@@ -1042,6 +1103,7 @@ impl eframe::App for App {
             self.push_toast("Refreshing Home…");
         }
         self.global_shortcuts(&ctx, &route);
+        self.window_shortcuts(&ctx);
         self.run_auto_pick(&ctx);
         self.save_progress(false);
         self.drive_account(&ctx);
@@ -1049,6 +1111,7 @@ impl eframe::App for App {
         self.track_window(&ctx);
         self.toasts_ui(&ctx);
         self.apply_actions(&ctx);
+        crate::platform::keep_display_awake(self.session.as_ref().is_some_and(Session::is_moving));
         if self.perf {
             self.work.push(began.elapsed().as_secs_f32());
         }
@@ -1063,12 +1126,19 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let elapsed = self.started.elapsed().as_secs_f64();
-        for (index, (at, name)) in self.args.keys.iter().enumerate() {
+        if std::mem::take(&mut self.release_modifiers) {
+            raw_input.events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        }
+        for (index, (at, chord)) in self.args.keys.iter().enumerate() {
             if elapsed >= *at && !self.keys_fired.contains(&index) {
                 self.keys_fired.push(index);
-                if let Some(key) = egui::Key::from_name(name) {
+                if let Some((modifiers, key)) = crate::args::parse_chord(chord) {
+                    if modifiers != egui::Modifiers::NONE {
+                        raw_input.events.push(egui::Event::ModifiersChanged(modifiers));
+                        self.release_modifiers = true;
+                    }
                     for pressed in [true, false] {
-                        raw_input.events.push(egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE });
+                        raw_input.events.push(egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers });
                     }
                 }
             }
@@ -1110,9 +1180,17 @@ impl eframe::App for App {
     }
 }
 
-fn open_in_browser(url: &str) {
-    // `rundll32 url.dll` hands the address to the default browser without a shell, so `&` in a URL stays literal.
-    let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+/// The stream that follows the one just watched: from the same binge group, else from the same addon at the same
+/// resolution. Only streams the player itself can open count; one that opens a web page would leave the player empty.
+fn pick_next<'a>(streams: &[&'a Stream], binge_group: Option<&str>, addon_id: &str, resolution: Option<&str>) -> Option<&'a Stream> {
+    let mut playable = streams.iter().copied().filter(|s| matches!(s.playback(), Some(Playback::Url(_) | Playback::Torrent { .. })));
+    let by_group = binge_group.and_then(|group| playable.clone().find(|s| s.binge_group.as_deref() == Some(group)));
+    by_group.or_else(|| {
+        playable.find(|s| {
+            s.addon_id == addon_id
+                && resolution.is_some_and(|r| s.facet_values().get(&nuvio_core::stream::Facet::Resolution).is_some_and(|v| v.iter().any(|have| have == r)))
+        })
+    })
 }
 
 fn save_png(path: &std::path::Path, image: &Arc<egui::ColorImage>) {
@@ -1125,5 +1203,23 @@ fn save_png(path: &std::path::Path, image: &Arc<egui::ColorImage>) {
         if let Err(error) = buffer.save(path) {
             tracing::error!(%error, "could not save the screenshot");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(url: Option<&str>, page: Option<&str>, group: &str) -> Stream {
+        Stream { url: url.map(str::to_owned), external_url: page.map(str::to_owned), binge_group: Some(group.into()), ..Stream::default() }
+    }
+
+    #[test]
+    fn the_next_episode_never_opens_a_web_page_by_itself() {
+        let page = stream(None, Some("https://example.com/watch"), "main");
+        let video = stream(Some("https://example.com/2.mkv"), None, "main");
+        assert_eq!(pick_next(&[&page], Some("main"), "addon", None), None);
+        assert_eq!(pick_next(&[&page, &video], Some("main"), "addon", None), Some(&video));
+        assert_eq!(pick_next(&[&video], Some("other"), "addon", None), None);
     }
 }

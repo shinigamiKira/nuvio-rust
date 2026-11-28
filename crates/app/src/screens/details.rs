@@ -28,12 +28,14 @@ pub fn show(cx: &mut Cx, ui: &mut Ui) {
             }
             let t = theme::get();
             ui_kit::spinner(ui, rect.center(), 18.0, t.accent);
+            back_button(cx, ui, rect.left_top() + vec2(20.0, 20.0));
         }
         Load::Failed(error) => {
             let t = theme::get();
             let rect = ui.available_rect_before_wrap();
             ui_kit::draw_text(ui, rect.center() - vec2(0.0, 10.0), Align2::CENTER_CENTER, "This title could not be loaded.", theme::semibold(size::TITLE_SM), t.text);
             ui_kit::draw_text(ui, rect.center() + vec2(0.0, 18.0), Align2::CENTER_CENTER, &error, theme::regular(size::BODY_SM), t.text_muted);
+            back_button(cx, ui, rect.left_top() + vec2(20.0, 20.0));
         }
         Load::Ready(meta) => {
             ScrollArea::vertical().id_salt(("details-scroll", &id)).auto_shrink([false, false]).show(ui, |ui| {
@@ -208,19 +210,16 @@ fn episodes(cx: &mut Cx, ui: &mut Ui, meta: &MetaDetails, season: Option<i64>, p
     });
     ui.add_space(8.0);
     if seasons.len() > 1 {
-        ScrollArea::horizontal().id_salt("season-scroll").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.spacing_mut().item_spacing.x = 8.0;
-                for s in &seasons {
-                    let label = if *s == 0 { "Specials".to_owned() } else { format!("Season {s}") };
-                    if ui_kit::chip(ui, &label, *s == current).clicked() {
-                        if let Some(details) = cx.state.details.as_mut() {
-                            details.season = Some(*s);
-                        }
+        ui_kit::paging_row(ui, egui::Id::unique("season-scroll"), pad, 16.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for s in &seasons {
+                let label = if *s == 0 { "Specials".to_owned() } else { format!("Season {s}") };
+                if ui_kit::chip(ui, &label, *s == current).clicked() {
+                    if let Some(details) = cx.state.details.as_mut() {
+                        details.season = Some(*s);
                     }
                 }
-            });
+            }
         });
         ui.add_space(14.0);
     }
@@ -252,8 +251,6 @@ fn episodes(cx: &mut Cx, ui: &mut Ui, meta: &MetaDetails, season: Option<i64>, p
             let text_w = rect.right() - text_left - 16.0;
             let number = video.episode.map(|e| format!("{e}.")).unwrap_or_default();
             let title = format!("{number} {}", video.title);
-            let g = ui_kit::galley(ui, title.trim(), theme::semibold(size::BODY_LG), t.text, text_w - 120.0, 1);
-            ui.painter().galley(pos2(text_left, rect.top() + 16.0), g, t.text);
             let mut meta_line: Vec<String> = Vec::new();
             if let Some(date) = video.released.as_deref().and_then(short_date) {
                 meta_line.push(date);
@@ -264,7 +261,11 @@ fn episodes(cx: &mut Cx, ui: &mut Ui, meta: &MetaDetails, season: Option<i64>, p
             if let Some(rating) = video.rating {
                 meta_line.push(format!("{rating:.1}/10"));
             }
-            ui_kit::draw_text(ui, pos2(rect.right() - 16.0, rect.top() + 28.0), Align2::RIGHT_CENTER, &meta_line.join("  ·  "), theme::regular(size::LABEL_SM), t.text_muted);
+            let facts = ui_kit::draw_text(ui, pos2(rect.right() - 16.0, rect.top() + 28.0), Align2::RIGHT_CENTER, &meta_line.join("  ·  "), theme::regular(size::LABEL_SM), t.text_muted);
+            // The title gets what the date, runtime and rating leave of the line.
+            let title_w = (facts.left() - text_left - 16.0).max(60.0);
+            let g = ui_kit::galley(ui, title.trim(), theme::semibold(size::BODY_LG), t.text, title_w, 1);
+            ui.painter().galley(pos2(text_left, rect.top() + 16.0), g, t.text);
             if let Some(overview) = video.overview.as_deref() {
                 let rows = if thumb_h > 110.0 { 3 } else { 2 };
                 let g = ui_kit::galley(ui, overview, theme::regular(size::BODY_SM), t.text_secondary, text_w, rows);
@@ -367,29 +368,25 @@ fn cast(cx: &mut Cx, ui: &mut Ui, meta: &MetaDetails, pad: f32) {
         ui_kit::section_header(ui, "Cast", None);
     });
     ui.add_space(10.0);
-    ScrollArea::horizontal().id_salt("cast-scroll").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(pad);
-            ui.spacing_mut().item_spacing.x = 18.0;
-            for person in meta.cast.iter().take(24) {
-                let (rect, _) = ui.allocate_exact_size(vec2(104.0, 150.0), Sense::hover());
-                let photo = Rect::from_center_size(pos2(rect.center().x, rect.top() + 48.0), vec2(96.0, 96.0));
-                if person.photo.is_some() {
-                    ui_kit::paint_cover_url_with(ui, &cx.svc.images, person.photo.as_deref(), photo, CornerRadius::same(255));
-                } else {
-                    ui.painter().circle_filled(photo.center(), 48.0, t.card);
-                    let initials: String = person.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect();
-                    ui_kit::draw_text(ui, photo.center(), Align2::CENTER_CENTER, &initials, theme::bold(size::TITLE_MD), t.text_secondary);
-                }
-                let name = ui_kit::galley(ui, &person.name, theme::semibold(size::LABEL_SM + 1.0), t.text, rect.width(), 2);
-                ui.painter().galley(pos2(rect.center().x - name.size().x / 2.0, photo.bottom() + 8.0), name.clone(), t.text);
-                if let Some(role) = person.role.as_deref() {
-                    let role = ui_kit::galley(ui, role, theme::regular(size::LABEL_XS), t.text_muted, rect.width(), 1);
-                    ui.painter().galley(pos2(rect.center().x - role.size().x / 2.0, photo.bottom() + 12.0 + name.size().y), role, t.text_muted);
-                }
+    ui_kit::paging_row(ui, egui::Id::unique("cast-scroll"), pad, 48.0, |ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        for person in meta.cast.iter().take(24) {
+            let (rect, _) = ui.allocate_exact_size(vec2(104.0, 150.0), Sense::hover());
+            let photo = Rect::from_center_size(pos2(rect.center().x, rect.top() + 48.0), vec2(96.0, 96.0));
+            if person.photo.is_some() {
+                ui_kit::paint_cover_url_with(ui, &cx.svc.images, person.photo.as_deref(), photo, CornerRadius::same(255));
+            } else {
+                ui.painter().circle_filled(photo.center(), 48.0, t.card);
+                let initials: String = person.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect();
+                ui_kit::draw_text(ui, photo.center(), Align2::CENTER_CENTER, &initials, theme::bold(size::TITLE_MD), t.text_secondary);
             }
-            ui.add_space(pad);
-        });
+            let name = ui_kit::galley(ui, &person.name, theme::semibold(size::LABEL_SM + 1.0), t.text, rect.width(), 2);
+            ui.painter().galley(pos2(rect.center().x - name.size().x / 2.0, photo.bottom() + 8.0), name.clone(), t.text);
+            if let Some(role) = person.role.as_deref() {
+                let role = ui_kit::galley(ui, role, theme::regular(size::LABEL_XS), t.text_muted, rect.width(), 1);
+                ui.painter().galley(pos2(rect.center().x - role.size().x / 2.0, photo.bottom() + 12.0 + name.size().y), role, t.text_muted);
+            }
+        }
     });
 }
 

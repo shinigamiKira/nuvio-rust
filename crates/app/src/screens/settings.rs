@@ -1,5 +1,7 @@
 //! Settings: addons, playback, appearance, storage and about, in a two pane layout.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, Align2, Color32, Popup, Rect, ScrollArea, Sense, Ui, pos2, vec2};
 use nuvio_core::addon::normalize_manifest_url;
 use nuvio_core::paths;
@@ -19,6 +21,9 @@ pub enum Page {
     Storage,
     About,
 }
+
+/// How old the cache sizes on the Storage page may get while it is open.
+const SIZES_FRESH: Duration = Duration::from_secs(5);
 
 const PAGES: [(Page, char, &str); 6] = [
     (Page::Account, icons::PERSON, "Account"),
@@ -250,8 +255,13 @@ fn addons(cx: &mut Cx, ui: &mut Ui) {
         let logo_rect = Rect::from_min_size(rect.min + vec2(16.0, 16.0), vec2(52.0, 52.0));
         ui_kit::paint_cover_url(ui, &cx.svc.images, logo.as_deref(), logo_rect, 12.0);
         let text_left = logo_rect.right() + 16.0;
-        ui_kit::draw_text(ui, pos2(text_left, rect.top() + 28.0), Align2::LEFT_CENTER, &name, theme::bold(size::BODY_LG), if enabled { t.text } else { t.text_muted });
-        let name_w = ui.painter().layout_no_wrap(name.clone(), theme::bold(size::BODY_LG), t.text).size().x;
+        // The lines beside the buttons end where the buttons begin.
+        let line_w = rect.right() - 214.0 - text_left;
+        let version_w = ui.painter().layout_no_wrap(version.clone(), theme::regular(size::LABEL_SM), t.text_muted).size().x;
+        let name_colour = if enabled { t.text } else { t.text_muted };
+        let title = ui_kit::galley(ui, &name, theme::bold(size::BODY_LG), name_colour, line_w - version_w - 10.0, 1);
+        let name_w = title.size().x;
+        ui.painter().galley(pos2(text_left, rect.top() + 28.0 - title.size().y / 2.0), title, name_colour);
         ui_kit::draw_text(ui, pos2(text_left + name_w + 10.0, rect.top() + 30.0), Align2::LEFT_CENTER, &version, theme::regular(size::LABEL_SM), t.text_muted);
         let mut line = Vec::new();
         match &status {
@@ -267,7 +277,8 @@ fn addons(cx: &mut Cx, ui: &mut Ui) {
             }
         }
         let status_colour = if matches!(status, Load::Failed(_)) { t.danger } else { t.text_secondary };
-        ui_kit::draw_text(ui, pos2(text_left, rect.top() + 50.0), Align2::LEFT_CENTER, &line.join(" · "), theme::regular(size::LABEL_SM + 0.5), status_colour);
+        let status_line = ui_kit::galley(ui, &line.join(" · "), theme::regular(size::LABEL_SM + 0.5), status_colour, line_w, 1);
+        ui.painter().galley(pos2(text_left, rect.top() + 50.0 - status_line.size().y / 2.0), status_line, status_colour);
         if !description.is_empty() {
             ui.painter().galley(pos2(text_left, rect.top() + 62.0), desc, t.text_muted);
         }
@@ -355,11 +366,11 @@ fn custom_mpv(cx: &mut Cx, ui: &mut Ui) {
         ui.horizontal(|ui| {
             if ui_kit::pill_button(ui, Some(icons::FOLDER), "Open mpv folder", PillStyle::Soft).clicked() {
                 let dir = crate::mpv_custom::ensure_folder();
-                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                crate::platform::open_folder(&dir);
             }
             if ui_kit::pill_button(ui, Some(icons::KEYBOARD), "Edit input.conf", PillStyle::Soft).clicked() {
                 let dir = crate::mpv_custom::ensure_folder();
-                let _ = std::process::Command::new("notepad").arg(dir.join("input.conf")).spawn();
+                crate::platform::edit_text_file(&dir.join("input.conf"));
             }
         });
         ui.add_space(8.0);
@@ -500,26 +511,44 @@ fn storage(cx: &mut Cx, ui: &mut Ui) {
     let images = nuvio_core::cache::DiskCache::new(paths::cache_dir().join("images"));
     let json = nuvio_core::cache::DiskCache::new(paths::cache_dir().join("json"));
     let mb = |bytes: u64| format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
-    let _ = &cx;
-    ui.label(egui::RichText::new(format!("Images: {}   ·   Addon responses: {}", mb(images.size_bytes()), mb(json.size_bytes()))).color(t.text_secondary).size(size::BODY_MD));
+    // Adding up a full cache reads thousands of file entries: done in the background, now and then while the page is up.
+    if cx.view.cache_sizes_asked.is_none_or(|at| at.elapsed() >= SIZES_FRESH) {
+        cx.view.cache_sizes_asked = Some(Instant::now());
+        let (images, json, slot, ctx) = (images.clone(), json.clone(), cx.view.cache_sizes.clone(), ui.ctx().clone());
+        cx.svc.runtime.spawn_blocking(move || {
+            let sizes = (images.size_bytes(), json.size_bytes());
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(sizes);
+            }
+            crate::services::wake(&ctx);
+        });
+    }
+    let sizes = cx.view.cache_sizes.lock().ok().and_then(|s| *s);
+    let line = match sizes {
+        Some((pictures, answers)) => format!("Images: {}   ·   Addon responses: {}", mb(pictures), mb(answers)),
+        None => "Adding up the caches…".to_owned(),
+    };
+    ui.label(egui::RichText::new(line).color(t.text_secondary).size(size::BODY_MD));
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         if ui_kit::pill_button(ui, Some(icons::DELETE), "Clear caches", PillStyle::Soft).clicked() {
             images.remove_all();
             json.remove_all();
+            cx.view.cache_sizes_asked = None;
         }
         if ui_kit::pill_button(ui, Some(icons::FOLDER), "Open data folder", PillStyle::Soft).clicked() {
-            let _ = std::process::Command::new("explorer").arg(paths::roaming_data_dir()).spawn();
+            crate::platform::open_folder(&paths::roaming_data_dir());
         }
     });
     ui.add_space(14.0);
     note(ui, &format!("Settings, library and watch progress: {}", paths::roaming_data_dir().display()));
-    note(ui, &format!("Caches and logs: {}", paths::local_data_dir().display()));
+    note(ui, &format!("Caches: {}", paths::local_data_dir().display()));
+    note(ui, &format!("Logs: {}", paths::log_dir().display()));
 }
 
 fn about(ui: &mut Ui) {
     heading(ui, "About");
-    note(ui, &format!("Nuvio for Windows (Rust) {}", env!("CARGO_PKG_VERSION")));
+    note(ui, &format!("Nuvio for {} (Rust) {}", crate::platform::NAME, env!("CARGO_PKG_VERSION")));
     note(ui, "A native port of the Nuvio desktop app. Based on Nuvio by NuvioMedia, licensed under GPL-3.0.");
     note(ui, "Playback by libmpv. Interface drawn with egui. Icons: Material Icons (Apache-2.0). Font: JetBrains Sans (OFL).");
 }

@@ -1,5 +1,5 @@
-//! Logging to `%LOCALAPPDATA%\NuvioRust\logs\nuvio.log`, and to the console when the app was started from one.
-//! `NUVIO_LOG` takes the usual filter syntax (`debug`, `nuvio_core=trace,info`).
+//! Logging to `nuvio.log` in the log folder (`nuvio_core::paths::log_dir`), and to the console when the app was started
+//! from one. `NUVIO_LOG` takes the usual filter syntax (`debug`, `nuvio_core=trace,info`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -13,7 +13,7 @@ use tracing_subscriber::fmt::MakeWriter;
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn log_dir() -> PathBuf {
-    nuvio_core::paths::local_data_dir().join("logs")
+    nuvio_core::paths::log_dir()
 }
 
 #[derive(Clone)]
@@ -54,7 +54,7 @@ impl<'a> MakeWriter<'a> for Sink {
 }
 
 pub fn init() {
-    let console = attach_parent_console();
+    let console = crate::platform::attach_console();
     let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("nuvio.log");
@@ -74,11 +74,4 @@ pub fn init() {
         .with_target(true)
         .with_writer(Sink { file, console })
         .init();
-}
-
-/// The exe is a GUI program, so Windows gives it no console. When it was started from a terminal, borrow that one.
-fn attach_parent_console() -> bool {
-    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-    // SAFETY: no pointers involved; failure just means there is no parent console.
-    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
 }
